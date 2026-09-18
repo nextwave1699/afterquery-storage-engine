@@ -57,9 +57,13 @@ def test_compat(report):
 
 
 def test_benchmark_ran(report):
-    """Full workload ran on both engines and was measured."""
+    """Every scored workload ran on both engines and was measured."""
     st = stage(report, "benchmark")
-    assert st.get("candidate_wa") is not None and st.get("wa_ratio") is not None
+    assert st.get("wa_ratio") is not None
+    want = report.get("contract", {}).get("workloads") or []
+    got = st.get("workloads", {})
+    assert want and all(got.get(w, {}).get("wa_ratio") is not None for w in want), \
+        "missing workloads: %s" % [w for w in want if w not in got]
 
 
 def test_guardrails(report):

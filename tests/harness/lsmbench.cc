@@ -16,6 +16,9 @@
 //   lsmbench selftest --db DIR
 //       small functional test of the engine API
 //
+// Every mode takes --workload NAME (mixed, uniform, series, blob; default
+// mixed, see workload.h).
+//
 // Exit status: 0 ok, 2 a read returned the wrong result, 3 engine error,
 // 4 usage error.  All engine I/O goes through BenchEnv (bench_env.h).
 #include <sys/resource.h>
@@ -53,6 +56,7 @@ const int kExitUsage = 4;
 struct Args {
   std::string mode;
   std::string db;
+  WorkloadKind workload = kMixed;
   uint64_t seed = 1;
   double scale = 1.0;
   std::string stats;
@@ -73,7 +77,7 @@ struct Args {
 
 void Usage() {
   fprintf(stderr,
-          "usage: lsmbench (describe|run|read|check|selftest) --db DIR --seed S --scale X ...\n");
+          "usage: lsmbench (describe|run|read|check|selftest) --db DIR --seed S --scale X [--workload W] ...\n");
   exit(kExitUsage);
 }
 
@@ -104,6 +108,9 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--stop-at-end") a.stop_at_end = true;
     else if (k == "--reuse-logs") a.reuse_logs = true;
     else if (k == "--plain-tables") a.plain_tables = true;
+    else if (k == "--workload") {
+      if (!ParseWorkloadKind(need(), &a.workload)) Usage();
+    }
     else Usage();
   }
   if (a.scale <= 0 || a.scale > 8) Usage();
@@ -152,7 +159,7 @@ leveldb::Options MakeOptions(BenchEnv* env, DbResources* res, bool create,
 class Runner {
  public:
   Runner(const Args& a, BenchEnv* env)
-      : args_(a), env_(env), wl_(a.seed, a.scale),
+      : args_(a), env_(env), wl_(a.seed, a.scale, a.workload),
         model_(a.seed, wl_.shape().universe), db_(nullptr), snapshot_(nullptr) {
     ack_fd_ = -1;
     if (!a.ack.empty()) {
@@ -559,7 +566,7 @@ uint64_t NowMs() {
 }
 
 int Describe(const Args& a) {
-  Workload wl(a.seed, a.scale);
+  Workload wl(a.seed, a.scale, a.workload);
   Model m(a.seed, wl.shape().universe);
   Step st;
   uint64_t steps = 0, gets = 0, scans = 0;

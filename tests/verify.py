@@ -11,18 +11,21 @@ unprivileged `lsm` user. Stages, each skipped if one it needs failed:
                 the same batches (see CRASH_SCENARIOS)
   compat        sealed pristine-written dbs + one fresh one: candidate reads
                 and extends, pristine reads the result
-  benchmark     full workload at BENCH_SEED, both engines; WA from the kernel
-                counters, guardrails from the MANIFEST history
+  benchmark     every workload in WORKLOADS at full scale and BENCH_SEED, both
+                engines; WA from the kernel counters, guardrails from the
+                MANIFEST history, per workload
 
-The gate is every stage plus the guardrails, which the untouched tree passes.
-The score is write_amp_ratio = candidate WA / pristine WA from this same run
-(untouched: 1.0, lower is better).
+The gate is every stage plus every workload's guardrails, which the untouched
+tree passes. The score is write_amp_ratio = geometric mean over the workloads
+of candidate WA / pristine WA from this same run (untouched: 1.0, lower is
+better). Only `mixed` is used by the correctness stages and the fixtures.
 
 The report (--out) is rewritten after every stage. test.sh turns it into
 the reward files via test_outputs.py.
 """
 import argparse
 import json
+import math
 import os
 import pwd
 import random
@@ -42,7 +45,10 @@ import manifest  # noqa: E402
 # The scored benchmark always uses this seed, so repeat runs measure the
 # same bytes. It lives only here; bench.py defaults to seed 1.
 BENCH_SEED = 604729
-BASELINE_WA_BAND = (11.0, 22.0)  # if pristine lands outside this, something is off with the box
+# Scored workloads and the pristine WA each should land in; outside the band
+# something is off with the box.
+WORKLOADS = ["mixed", "uniform", "series", "blob"]
+BASELINE_WA_BAND = {"mixed": (11.0, 22.0), "uniform": (7.0, 16.0), "series": (3.0, 7.0), "blob": (3.5, 8.0)}
 BENCH_SCALE = 3.0
 SMALL_SCALE = 0.25
 CRASH_SCALE = 0.3
@@ -77,7 +83,7 @@ class Verifier:
         self.work = args.work
         self.user = args.user or None
         self.report = {"stages": {}, "log": [], "contract": {
-            "bench_seed": BENCH_SEED, "bench_scale": BENCH_SCALE, "max_l0_depth": MAX_L0_DEPTH,
+            "bench_seed": BENCH_SEED, "bench_scale": BENCH_SCALE, "workloads": WORKLOADS, "max_l0_depth": MAX_L0_DEPTH,
             "space_ratio_max": SPACE_RATIO_MAX, "read_ratio_max": READ_RATIO_MAX,
             "files_ratio_max": FILES_RATIO_MAX, "max_file_size": MAX_FILE_SIZE,
             "rss_extra_max_kb": RSS_EXTRA_MAX_KB, "memtable_switch_ratio_min": MEMTABLE_SWITCH_RATIO_MIN,
@@ -209,8 +215,9 @@ class Verifier:
         if not self.ok_run(m):
             raise Fail("%s failed: %s" % (what, describe_failure(m)))
 
-    def check(self, which, db, seed, scale, batches, cont=0, paranoid=True, name=None, timeout=SMALL_TIMEOUT):
-        extra = ["--batches", str(batches)]
+    def check(self, which, db, seed, scale, batches, cont=0, paranoid=True, name=None, timeout=SMALL_TIMEOUT,
+              workload="mixed"):
+        extra = ["--batches", str(batches), "--workload", workload]
         if cont:
             extra += ["--continue", str(cont)]
         if paranoid:
@@ -249,9 +256,9 @@ class Verifier:
             raise Fail("%s: obsolete WAL files left behind: %s" % (what, info["stale_logs"][:5]))
         return info
 
-    def describe(self, seed, scale):
-        status, out, err = self.run_as_user([self.ref_bin, "describe", "--seed", str(seed), "--scale", str(scale)],
-                                            timeout=300)
+    def describe(self, seed, scale, workload="mixed"):
+        status, out, err = self.run_as_user([self.ref_bin, "describe", "--seed", str(seed), "--scale", str(scale),
+                                             "--workload", workload], timeout=300)
         if status != 0:
             raise Fail("describe failed: %s" % err[-300:])
         return json.loads(out.strip().splitlines()[-1])
@@ -475,55 +482,79 @@ class Verifier:
         st["ok"] = True
 
     def benchmark(self):
-        st = self.report["stages"]["benchmark"] = {"ok": None}
+        st = self.report["stages"]["benchmark"] = {"ok": None, "workloads": {}}
+        fails = []
+        for w in WORKLOADS:
+            res = st["workloads"][w] = self.bench_workload(w)
+            fails += ["%s: %s" % (w, f) for f in res["guardrails"]["failures"]]
+            self.save()
+        ws = st["workloads"]
+        n = float(len(WORKLOADS))
+        geo = lambda key: math.exp(sum(math.log(ws[w][key]) for w in WORKLOADS) / n)
+        st["baseline_wa"] = geo("baseline_wa")
+        st["candidate_wa"] = geo("candidate_wa")
+        st["wa_ratio"] = geo("wa_ratio")
+        st["guardrails"] = {"ok": not fails, "failures": fails}
+        st["ok"] = True
+        if fails:
+            self.log("guardrail failures: " + "; ".join(fails))
+        self.log("score (geometric mean of ratios) %.4f: %s" % (
+            st["wa_ratio"], ", ".join("%s %.4f" % (w, ws[w]["wa_ratio"]) for w in WORKLOADS)))
+
+    def bench_workload(self, w):
         seed, scale = self.args.bench_seed or BENCH_SEED, BENCH_SCALE
-        desc = self.describe(seed, scale)
+        desc = self.describe(seed, scale, w)
         logical = desc["logical_bytes"]
-        st["logical_bytes"] = logical
-        st["batches"] = desc["batches"]
+        st = {"logical_bytes": logical, "batches": desc["batches"]}
         results = {}
         for which in ("ref", "cand"):
-            db = self.udir("db-bench-" + which)
+            db = self.udir("db-bench-%s-%s" % (w, which))
             r = results[which] = {}
             t = time.time()
-            m = self.harness(which, "run", db, seed, scale, ["--stats", os.path.join(self.work, "meas", "stats-%s-run.json" % which)],
-                             timeout=RUN_TIMEOUT, name="bench-%s-run" % which)
-            self.expect_ok(m, "%s benchmark run" % which)
+            m = self.harness(which, "run", db, seed, scale,
+                             ["--workload", w, "--stats", os.path.join(self.work, "meas", "stats-%s-%s-run.json" % (w, which))],
+                             timeout=RUN_TIMEOUT, name="bench-%s-%s-run" % (w, which))
+            self.expect_ok(m, "%s %s benchmark run" % (which, w))
             r["run"] = strip(m)
-            info_run = self.hygiene(db, "%s benchmark run" % which)
+            info_run = self.hygiene(db, "%s %s benchmark run" % (which, w))
             r["manifest_run"] = {k: info_run[k] for k in ("levels", "level_bytes", "max_l0", "max_l0_depth",
                                                           "max_files", "max_file_size", "max_total_bytes",
                                                           "mean_total_bytes", "edits", "files_added", "bytes_added",
                                                           "memtable_switches", "table_bytes_present",
                                                           "orphan_bytes", "referenced_bytes")}
-            m = self.harness(which, "read", db, seed, scale, ["--stats", os.path.join(self.work, "meas", "stats-%s-read.json" % which)],
-                             timeout=RUN_TIMEOUT, name="bench-%s-read" % which)
-            self.expect_ok(m, "%s benchmark read phase" % which)
+            m = self.harness(which, "read", db, seed, scale,
+                             ["--workload", w, "--stats", os.path.join(self.work, "meas", "stats-%s-%s-read.json" % (w, which))],
+                             timeout=RUN_TIMEOUT, name="bench-%s-%s-read" % (w, which))
+            self.expect_ok(m, "%s %s benchmark read phase" % (which, w))
             r["read"] = strip(m)
             r["wall_s"] = time.time() - t
             r["written"] = r["run"]["wchar"] + r["read"]["wchar"]
             r["wa"] = r["written"] / float(logical)
             r["read_bytes_f"] = r["read"]["rchar"]
             r["maxrss_kb"] = max(r["run"]["maxrss_kb"], r["read"]["maxrss_kb"])
-            self.log("%s: write amplification %.3f (%.0f MB written / %.0f MB logical), phase F read %.0f MB, rss %d MB, %.0fs" % (
-                which, r["wa"], r["written"] / 1e6, logical / 1e6, r["read_bytes_f"] / 1e6, r["maxrss_kb"] // 1024, r["wall_s"]))
-            self.save()
+            self.log("%s %s: write amplification %.3f (%.0f MB written / %.0f MB logical), phase F read %.0f MB, rss %d MB, %.0fs" % (
+                w, which, r["wa"], r["written"] / 1e6, logical / 1e6, r["read_bytes_f"] / 1e6, r["maxrss_kb"] // 1024, r["wall_s"]))
         # cross reads at full scale
-        a, _, _ = self.check("ref", os.path.join(self.work, "db-bench-cand"), seed, scale, desc["batches"],
-                             name="bench-ref-reads-cand", timeout=RUN_TIMEOUT)
+        db_ref = os.path.join(self.work, "db-bench-%s-ref" % w)
+        db_cand = os.path.join(self.work, "db-bench-%s-cand" % w)
+        a, _, _ = self.check("ref", db_cand, seed, scale, desc["batches"], workload=w,
+                             name="bench-%s-ref-reads-cand" % w, timeout=RUN_TIMEOUT)
         if a != desc["batches"]:
-            raise Fail("pristine reader saw %d batches in the candidate's benchmark database" % a)
-        a, _, _ = self.check("cand", os.path.join(self.work, "db-bench-ref"), seed, scale, desc["batches"],
-                             name="bench-cand-reads-ref", timeout=RUN_TIMEOUT)
+            raise Fail("%s: pristine reader saw %d batches in the candidate's benchmark database" % (w, a))
+        a, _, _ = self.check("cand", db_ref, seed, scale, desc["batches"], workload=w,
+                             name="bench-%s-cand-reads-ref" % w, timeout=RUN_TIMEOUT)
         if a != desc["batches"]:
-            raise Fail("candidate reader saw %d batches in the pristine benchmark database" % a)
+            raise Fail("%s: candidate reader saw %d batches in the pristine benchmark database" % (w, a))
+        shutil.rmtree(db_ref, ignore_errors=True)
+        shutil.rmtree(db_cand, ignore_errors=True)
         st["results"] = results
         base, cand = results["ref"], results["cand"]
         st["baseline_wa"] = base["wa"]
         st["candidate_wa"] = cand["wa"]
         st["wa_ratio"] = cand["wa"] / base["wa"]
-        if not (BASELINE_WA_BAND[0] <= base["wa"] <= BASELINE_WA_BAND[1]):
-            raise Fail("verifier self-check: pristine write amplification %.2f outside %s" % (base["wa"], BASELINE_WA_BAND))
+        band = BASELINE_WA_BAND[w]
+        if not (band[0] <= base["wa"] <= band[1]):
+            raise Fail("verifier self-check: pristine %s write amplification %.2f outside %s" % (w, base["wa"], band))
         g = st["guardrails"] = {}
         mr_b, mr_c = base["manifest_run"], cand["manifest_run"]
         g["max_l0_depth"] = mr_c["max_l0_depth"]
@@ -556,10 +587,9 @@ class Verifier:
             fails.append("candidate took %.0fs vs %.0fs baseline" % (cand["wall_s"], base["wall_s"]))
         g["failures"] = fails
         g["ok"] = not fails
-        st["ok"] = True
-        if fails:
-            self.log("guardrail failures: " + "; ".join(fails))
-        self.log("candidate WA %.3f, pristine %.3f, ratio %.4f" % (cand["wa"], base["wa"], st["wa_ratio"]))
+        self.log("%s: candidate WA %.3f, pristine %.3f, ratio %.4f%s" % (
+            w, cand["wa"], base["wa"], st["wa_ratio"], ("; " + "; ".join(fails)) if fails else ""))
+        return st
 
     def run(self):
         self.save()

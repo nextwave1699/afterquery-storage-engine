@@ -8,7 +8,12 @@
 // only has to remember one 32-bit number per id and can regenerate the value
 // expected from any read.
 //
-// Phases (sizes scale linearly with `scale`):
+// There are several workloads (--workload). `mixed` is the original one and
+// the only one the crash, compatibility and differential stages use; its
+// steps and values must never change, or the sealed fixtures stop matching.
+// The others are scored alongside it and are described at WorkloadKind.
+//
+// Phases of `mixed` (sizes scale linearly with `scale`):
 //   A  load        sequential inserts of ids [0, N_A)
 //   B  insert      random-order inserts of ids [N_A, N_A+N_B), some point reads
 //   C  update      updates, 75% inside one contiguous hot key range and 25%
@@ -37,6 +42,36 @@ static const uint32_t kKeyLen = 16;
 static const uint32_t kMinValue = 48;
 static const uint32_t kMaxValue = 400;
 static const uint32_t kDeletedBit = 0x80000000u;
+static const uint32_t kMaxAnyValue = 8192;  // largest value any workload writes
+
+//   mixed    phases A-E below (the original workload)
+//   uniform  load, then uniform random overwrites of every key with a few
+//            deletes and snapshots: the classic worst case for leveling
+//   series   ids grow like timestamps; 12% of writes are late corrections to
+//            the most recent ids, and the oldest ids are purged in key order
+//            to keep a bounded live window (TTL-style range deletes)
+//   blob     1-6 KB values; load, then updates where 70% hit a scattered
+//            hot set of 8% of the keys
+enum WorkloadKind { kMixed = 0, kUniform, kSeries, kBlob };
+
+inline bool ParseWorkloadKind(const std::string& name, WorkloadKind* k) {
+  if (name == "mixed") *k = kMixed;
+  else if (name == "uniform") *k = kUniform;
+  else if (name == "series") *k = kSeries;
+  else if (name == "blob") *k = kBlob;
+  else return false;
+  return true;
+}
+
+// Value lengths depend on the workload, so they are a process-wide setting
+// that the Workload constructor installs before anything is generated.
+struct ValueProfile {
+  uint32_t min_len, max_len;
+};
+inline ValueProfile& CurrentValueProfile() {
+  static ValueProfile p{kMinValue, kMaxValue};
+  return p;
+}
 
 inline uint64_t Mix64(uint64_t x) {
   x += 0x9E3779B97F4A7C15ull;
@@ -82,7 +117,8 @@ struct ValueGen {
     return Mix64(Mix64(seed ^ 0x5157ull) + Mix64(id * 0x100000001B3ull + w));
   }
   static uint32_t Length(uint64_t seed, uint64_t id, uint32_t w) {
-    return kMinValue + static_cast<uint32_t>(Salt(seed, id, w) % (kMaxValue - kMinValue + 1));
+    const ValueProfile& p = CurrentValueProfile();
+    return p.min_len + static_cast<uint32_t>(Salt(seed, id, w) % (p.max_len - p.min_len + 1));
   }
   static void Fill(uint64_t seed, uint64_t id, uint32_t w, char* out, uint32_t len) {
     Rng r(Salt(seed, id, w) ^ 0xABCDull);
@@ -108,7 +144,7 @@ struct ValueGen {
   static bool Equals(uint64_t seed, uint64_t id, uint32_t w, const char* data, size_t n) {
     uint32_t len = Length(seed, id, w);
     if (n != len) return false;
-    char buf[kMaxValue];
+    char buf[kMaxAnyValue];
     Fill(seed, id, w, buf, len);
     return memcmp(buf, data, len) == 0;
   }
@@ -185,12 +221,19 @@ struct WorkloadShape {
   uint64_t universe;      // ids that may ever be written
   uint64_t read_universe; // ids that may be read (includes never-written ids)
   uint64_t f_gets, f_scans, f_scan_len, f_rscans, f_rscan_len;
+  // series only: live window kept after purging, and how far back late
+  // corrections reach
+  uint64_t window = 0, lag = 0;
 
-  explicit WorkloadShape(double scale) {
+  WorkloadShape(double scale, WorkloadKind kind) {
     auto sc = [&](double base, uint64_t min) {
       uint64_t v = static_cast<uint64_t>(base * scale + 0.5);
       return v < min ? min : v;
     };
+    if (kind != kMixed) {
+      InitOther(scale, kind);
+      return;
+    }
     n_load = sc(240000, 200);
     n_insert = sc(240000, 200);
     n_hot = sc(30000, 64);
@@ -206,13 +249,49 @@ struct WorkloadShape {
     f_rscans = sc(20, 4);
     f_rscan_len = 200;
   }
+
+ private:
+  // n_load: keys loaded first (uniform, blob); n_updates: operations of the
+  // main phase (series: ids appended); n_hot: blob's hot set.
+  void InitOther(double scale, WorkloadKind kind) {
+    auto sc = [&](double base, uint64_t min) {
+      uint64_t v = static_cast<uint64_t>(base * scale + 0.5);
+      return v < min ? min : v;
+    };
+    n_insert = n_deletes = n_mixed = n_mixed_new = 0;
+    n_hot = 0;
+    if (kind == kUniform) {
+      n_load = sc(200000, 200);
+      n_updates = sc(600000, 400);
+      universe = n_load;
+    } else if (kind == kSeries) {
+      n_load = 0;
+      n_updates = sc(700000, 800);
+      universe = n_updates;
+      window = sc(180000, 200);
+      lag = sc(20000, 50);
+    } else {
+      n_load = sc(30000, 100);
+      n_updates = sc(30000, 100);
+      n_hot = n_load * 8 / 100 + 1;
+      universe = n_load;
+    }
+    read_universe = universe + universe / 16 + 64;
+    f_gets = sc(20000, 200);
+    f_scans = sc(200, 8);
+    f_scan_len = kind == kBlob ? 50 : 500;
+    f_rscans = sc(20, 4);
+    f_rscan_len = kind == kBlob ? 20 : 200;
+  }
 };
 
 // Generates the steps of the write phases (A..E) and, separately, phase F.
 class Workload {
  public:
-  Workload(uint64_t seed, double scale)
-      : seed_(seed), shape_(scale), rng_(seed ^ 0x77ull), batches_(0) {
+  Workload(uint64_t seed, double scale, WorkloadKind kind = kMixed)
+      : seed_(seed), kind_(kind), shape_(scale, kind), rng_(seed ^ 0x77ull), batches_(0) {
+    ValueProfile& vp = CurrentValueProfile();
+    vp = kind == kBlob ? ValueProfile{1024, 6144} : ValueProfile{kMinValue, kMaxValue};
     Rng hr(seed ^ 0x407ull);
     // Phase C's hot range: n_hot consecutive ids somewhere in the loaded space.
     hot_lo_ = hr.Below(shape_.n_load + shape_.n_insert - shape_.n_hot);
@@ -227,6 +306,7 @@ class Workload {
   }
 
   const WorkloadShape& shape() const { return shape_; }
+  WorkloadKind kind() const { return kind_; }
   uint64_t seed() const { return seed_; }
   uint64_t batches() const { return batches_; }
 
@@ -240,6 +320,7 @@ class Workload {
     st->ids.clear();
     st->count = 0;
     st->id = 0;
+    if (kind_ != kMixed) return NextOther(st);
     while (true) {
       switch (pos_) {
         case 0:  // phase A marker
@@ -298,11 +379,17 @@ class Workload {
     m.kind = kStepPhase;
     m.phase = 'F';
     out->push_back(m);
+    // series reads mostly hit the live window at the end of the id space
+    const uint64_t recent = kind_ == kSeries ? shape_.window : shape_.universe;
     for (uint64_t i = 0; i < shape_.f_gets; i++) {
       Step s;
       s.kind = kStepGet;
       s.phase = 'F';
-      s.id = r.Chance(85) ? r.Below(shape_.universe) : r.Below(shape_.read_universe);
+      if (kind_ == kSeries && r.Chance(85)) {
+        s.id = shape_.universe - 1 - r.Below(recent);
+      } else {
+        s.id = r.Chance(85) ? r.Below(shape_.universe) : r.Below(shape_.read_universe);
+      }
       out->push_back(s);
     }
     for (uint64_t i = 0; i < shape_.f_scans; i++) {
@@ -547,7 +634,133 @@ class Workload {
     return true;
   }
 
+  // uniform, series and blob: an optional load phase 'A', then the main
+  // phase 'B'; with AllowExtension, 'X' keeps going over existing ids.
+  bool NextOther(Step* st) {
+    while (true) {
+      switch (pos_) {
+        case 0:
+          pos_ = 1; sub_ = 0;
+          if (shape_.n_load == 0) break;
+          return Marker(st, 'A');
+        case 1:
+          if (sub_ >= shape_.n_load) { pos_ = 2; sub_ = 0; break; }
+          return OtherLoadStep(st);
+        case 2:
+          pos_ = 3; sub_ = 0;
+          return Marker(st, 'B');
+        case 3:
+          if (sub_ >= shape_.n_updates) {
+            if (snap_pending_) { snap_pending_ = false; return SnapCheck(st, 'B'); }
+            pos_ = 4; break;
+          }
+          return OtherMainStep(st, 'B');
+        case 4:
+          if (!allow_extension_) return false;
+          pos_ = 5;
+          return Marker(st, 'X');
+        default:
+          if (!allow_extension_) return false;
+          return OtherMainStep(st, 'X');
+      }
+    }
+  }
+
+  bool OtherLoadStep(Step* st) {
+    Batch(st, 'A');
+    int per = kind_ == kBlob ? 2 : 8;
+    for (int i = 0; i < per && sub_ < shape_.n_load; i++) {
+      AddPut(st, sub_);
+      sub_++;
+    }
+    return true;
+  }
+
+  // A blob hot id: one of n_hot ids scattered over the whole key space.
+  uint64_t BlobHotId() {
+    return Mix64(seed_ ^ 0xB10Bull ^ rng_.Below(shape_.n_hot)) % shape_.n_load;
+  }
+  uint64_t SeriesRecentId() {
+    uint64_t live = head_ - purge_next_;
+    return head_ - 1 - rng_.Below(live == 0 ? 1 : live);
+  }
+
+  bool OtherMainStep(Step* st, char phase) {
+    const bool ext = phase == 'X';
+    if (kind_ == kUniform && !ext) {
+      if (snap_pending_ && main_batches_ >= snap_check_at_) {
+        snap_pending_ = false;
+        return SnapCheck(st, phase);
+      }
+      if (main_batches_ > 0 && main_batches_ % 3000 == 0 && !snap_pending_ && snap_taken_at_ != main_batches_) {
+        snap_taken_at_ = main_batches_;
+        snap_pending_ = true;
+        snap_check_at_ = main_batches_ + 1500;
+        st->kind = kStepSnapTake;
+        st->phase = phase;
+        for (int i = 0; i < 64; i++) st->ids.push_back(ExistingId());
+        return true;
+      }
+    }
+    uint64_t roll = rng_.Below(100);
+    if (kind_ == kSeries) {
+      if (head_ > purge_next_ && roll < 10) {
+        st->kind = kStepGet;
+        st->phase = phase;
+        st->id = rng_.Chance(90) ? SeriesRecentId() : rng_.Below(shape_.read_universe);
+        return true;
+      }
+      if (head_ > purge_next_ && roll < 11) {
+        st->kind = kStepScan;
+        st->phase = phase;
+        st->id = SeriesRecentId();
+        st->count = 100 + static_cast<uint32_t>(rng_.Below(401));
+        return true;
+      }
+      Batch(st, phase);
+      main_batches_++;
+      for (int i = 0; i < 8; i++) {
+        bool late = head_ > 0 && (ext || head_ >= shape_.universe || rng_.Chance(12));
+        if (late) {
+          uint64_t back = head_ - purge_next_;
+          if (back > shape_.lag) back = shape_.lag;
+          if (back == 0) continue;
+          AddPut(st, head_ - 1 - rng_.Below(back));
+        } else {
+          AddPut(st, head_++);
+          if (!ext) sub_++;
+        }
+      }
+      // keep the live window bounded: purge the oldest ids in key order
+      while (head_ - purge_next_ > shape_.window && st->ops.size() < 24) {
+        AddDel(st, purge_next_++);
+      }
+      return true;
+    }
+    uint32_t get_pct = kind_ == kBlob ? 10 : 8;
+    if (roll < get_pct) return Get(st, phase);
+    if (roll < get_pct + 1) {
+      return kind_ == kBlob ? Scan(st, phase, 8, 32) : Scan(st, phase, 50, 200);
+    }
+    Batch(st, phase);
+    main_batches_++;
+    int n = kind_ == kBlob ? 1 + static_cast<int>(rng_.Below(2)) : 1 + static_cast<int>(rng_.Below(8));
+    for (int i = 0; i < n && (ext || sub_ < shape_.n_updates); i++) {
+      uint64_t r = rng_.Below(100);
+      if (r < 5) {
+        AddDel(st, ExistingId());
+      } else if (kind_ == kBlob && r < 75) {
+        AddPut(st, BlobHotId());
+      } else {
+        AddPut(st, ExistingId());
+      }
+      if (!ext) sub_++;
+    }
+    return true;
+  }
+
   const uint64_t seed_;
+  const WorkloadKind kind_;
   const WorkloadShape shape_;
   Rng rng_;
   uint64_t batches_;
@@ -559,6 +772,7 @@ class Workload {
   int pos_;
   uint64_t sub_;
   uint64_t mixed_new_next_ = 0;
+  uint64_t head_ = 0, purge_next_ = 0, main_batches_ = 0;  // uniform/series/blob
   uint64_t insert_batches_ = 0, update_batches_ = 0, delete_batches_ = 0, mixed_batches_ = 0;
   bool did_read_ = false;
   int pending_read_ = 0;

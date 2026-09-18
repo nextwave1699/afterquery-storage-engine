@@ -1,8 +1,8 @@
 #!/bin/bash
-# Runs the verifier image against deliberately broken or cheating trees and
-# checks that each gets gate 0 with both reward files present. nop, oracle
-# and seek-only are valid engines, so they must get gate 1 (the objective
-# write_amp_ratio is printed: 1.0, ~0.35, ~0.43).
+# Runs the verifier image against deliberately broken, cheating or
+# guardrail-breaking trees and checks that each gets gate 0 with both reward
+# files present. nop and sample (scripts/sample_candidate.patch) are valid
+# engines and must get gate 1; the score is printed (1.0 and ~0.85).
 #
 # usage: scripts/docker_failure_paths.sh [case ...]     (default: all)
 # Needs the image built:  docker build -t lsm-verifier tests
@@ -22,7 +22,9 @@ make_case() {
   local t="$dir/leveldb"
   case "$name" in
     nop) ;;
-    oracle) (cd "$t" && patch -p1 -s < "$ROOT/solution/compaction.patch") ;;
+    sample) (cd "$t" && patch -p1 -s < "$ROOT/scripts/sample_candidate.patch") ;;
+    old-reference)  # the single-workload reference: no seek compactions, so series scans blow up
+      (cd "$t" && patch -p1 -s < "$ROOT/scripts/old_reference.patch") ;;
     nobuild) echo "this is not C++" >> "$t/db/db_impl.cc" ;;
     missing) rm -rf "$t"; mkdir -p "$t" ;;
     header-break) echo "#error broken public header" >> "$t/include/leveldb/db.h" ;;
@@ -106,7 +108,7 @@ s=s.replace(old,"               (mem_->ApproximateMemoryUsage() <= 64u * 1024 * 
 open(p,"w").write(s)
 EOF
       ;;
-    seek-only)  # the trivial change alone: no seek compactions (valid, ratio ~0.43)
+    seek-only)  # no seek compactions: fine on mixed, but series reads 24x over the guardrail
       python3 - "$t/db/version_set.cc" <<'EOF'
 import sys; p=sys.argv[1]; s=open(p).read()
 old="bool Version::UpdateStats(const GetStats& stats) {\n  FileMetaData* f = stats.seek_file;\n  if (f != nullptr) {"
@@ -152,7 +154,7 @@ run_case() {
   local reward="?" ; [ -f "$logs/reward.txt" ] && reward=$(cat "$logs/reward.txt")
   local jok="missing"; [ -f "$logs/reward.json" ] && jok=$(python3 -c "import json;print(json.load(open('$logs/reward.json'))['reward'])" 2>/dev/null || echo bad)
   local expect=0
-  case "$name" in nop|oracle|seek-only) expect=1 ;; esac
+  case "$name" in nop|sample) expect=1 ;; esac
   local why; why=$(python3 -c "
 import json
 try:
@@ -167,7 +169,7 @@ except Exception as e: print('no report: %s' % e)
   printf '%-22s reward.txt=%s reward.json=%s expected=%s %s  %s\n' "$name" "$reward" "$jok" "$expect" "$verdict" "$why"
 }
 
-CASES="${*:-nop oracle nobuild missing header-break wrong-get scan-bug no-compaction no-wal crash-in-compaction hang format-change big-memtable seek-only tiered-constants planted-reward verifier-exception}"
+CASES="${*:-nop sample old-reference nobuild missing header-break wrong-get scan-bug no-compaction no-wal crash-in-compaction hang format-change big-memtable seek-only tiered-constants planted-reward verifier-exception}"
 for c in $CASES; do
   make_case "$c" || continue
   run_case "$c" &

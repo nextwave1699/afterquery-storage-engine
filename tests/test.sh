@@ -5,8 +5,9 @@
 #
 # Writes to /logs/verifier:
 #   reward.txt   the gate: 1 if every stage and guardrail passes, else 0
-#   reward.json  gate_passed (same value), the objective write_amp_ratio, and
-#                informational metrics (write_amp, stage flags...)
+#   reward.json  gate_passed (same value), the objective write_amp_ratio (the
+#                geometric mean over the workloads), one write_amp_ratio_<w>
+#                per workload, and informational metrics (stage flags...)
 #   report.json  verify.py's full report
 #   pytest.txt   pytest output
 #
@@ -35,6 +36,10 @@ write_zero() {
   "compat_ok": 0,
   "guardrails_ok": 0,
   "write_amp_ratio": 1.0,
+  "write_amp_ratio_mixed": 1.0,
+  "write_amp_ratio_uniform": 1.0,
+  "write_amp_ratio_series": 1.0,
+  "write_amp_ratio_blob": 1.0,
   "write_amp": 0.0,
   "baseline_write_amp": 0.0,
   "wa_reduction": 0.0
@@ -86,6 +91,10 @@ out = {
     "baseline_write_amp": base,
     "wa_reduction": (1.0 - wa / base) if (wa > 0 and base > 0) else 0.0,
 }
+# per-workload ratios, same rule: 1.0 unless the gate passed
+for w in ("mixed", "uniform", "series", "blob"):
+    wr = num(bench.get("workloads", {}).get(w, {}).get("wa_ratio"), 1.0)
+    out["write_amp_ratio_" + w] = wr if reward else 1.0
 tmp = out_path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(out, f, indent=2, sort_keys=True)

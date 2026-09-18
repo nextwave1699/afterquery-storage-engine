@@ -9,15 +9,16 @@ artifacts = [
 name = "afterquery/storage-engine"
 version = "1.0.0"
 description = """
-Change the compaction strategy of a pinned LevelDB (1.23) so that a fixed \
-730 MB LSM-tree workload (sequential and random inserts, hot-range updates, \
-range purges, a sliding hot window, interleaved reads and snapshots) is \
-written with as low a kernel-measured write amplification as possible \
-relative to the untouched engine (14.1 on the scored seed; the reference \
-solution reaches 0.35x of that), while every read stays correct, crash \
-recovery at every engine event works for both engines, the pristine engine \
-can read the candidate's databases and vice versa, and level-0 depth, \
-space, read bytes and memory stay inside the baseline's envelope."""
+Change the compaction strategy of a pinned LevelDB (1.23) so that four \
+fixed LSM-tree workloads (a mixed insert/update/delete/scan workload, uniform \
+random overwrites, time-series appends with late corrections and TTL-style \
+purges, and large values with a scattered hot set) are written with as few \
+bytes as possible relative to the untouched engine (score: geometric mean of \
+the per-workload write-amplification ratios), while every read stays \
+correct, crash recovery at every engine event works for both engines, the \
+pristine engine can read the candidate's databases and vice versa, and \
+level-0 depth, space, read bytes and memory stay inside the baseline's \
+envelope on every workload."""
 authors = [
   { name = "nextwave1699", email = "nextwave1699@gmail.com" },
 ]
@@ -37,44 +38,42 @@ keywords = [
 author_name = "nextwave1699"
 author_email = "nextwave1699@gmail.com"
 difficulty_explanation = """
-The score is the candidate's write amplification divided by the pristine \
-engine's on the same fixed workload (untouched 1.0 at WA 14.10; lower is \
-better).  The easy win is real but limited: disabling LevelDB's \
-seek-triggered compactions takes the ratio to 0.43 (WA 6.07).  Min-overlap \
-file selection or grandparent-aligned outputs on top of that gain a few \
-percent each, and the constant tweaks that would go further (a larger \
-level-0 trigger, a bigger level 1) are ruled out by the level-0 depth and \
-peak-space guardrails in the gate, which hold the candidate to the \
-baseline's read-amplification and space envelope.  Reaching the reference's \
-0.35 needs several independent compaction-policy changes that each require \
-understanding version_set.cc: how compaction inputs are picked, how outputs \
-are cut against the grandparent level, how overwritten versions and \
-tombstones are dropped, and what the on-disk invariants of levels >= 1 and \
-of level-0 file numbering are (the pristine engine's Get relies on them and \
-the verifier reads every candidate database with the pristine engine).  \
-Every change must survive eleven crash scenarios that SIGKILL the process at \
-WAL, table, MANIFEST, file-removal, compaction and recovery events, with the \
-pristine engine recovering the same directory, and must keep the MANIFEST, \
-WAL and table formats byte-compatible.  Nothing the engine reports is \
-trusted: bytes are read from the kernel, the level layout from a MANIFEST \
-replay."""
+The score is the geometric mean over four workloads of the candidate's \
+write amplification divided by the pristine engine's (untouched 1.0).  The \
+workloads pull compaction policy in different directions, and every \
+workload has the same guardrails (level-0 depth <= 4, peak space 1.25x, \
+phase-F read bytes 1.5x, time, memory), so no single knob wins.  The \
+biggest single lever on mixed and uniform, disabling LevelDB's \
+seek-triggered compactions, fails the gate: on series, whose scans start \
+inside purged key ranges, the tombstones are then never compacted away and \
+phase-F reads grow 24x and wall time 6x.  A good solution has to replace \
+seek compactions with something that knows when a compaction pays for \
+itself (tombstone density, overlap cost, how hot a file still is), choose \
+inputs and cut outputs well (min-overlap selection, grandparent-aligned \
+outputs), and handle append-mostly data (series) and large values (blob) \
+without breaking space or read limits on the update-heavy ones.  That needs \
+a working model of version_set.cc and db_impl.cc: how compactions are \
+scored and picked, how outputs are cut against the grandparent level, when \
+overwritten versions and tombstones can be dropped, and the on-disk \
+invariants of levels >= 1 and level-0 file numbering (the pristine engine's \
+Get relies on them, and the verifier reads every candidate database with \
+the pristine engine).  Every change must survive eleven crash scenarios, \
+with the pristine engine recovering the same directory, and keep the \
+MANIFEST, WAL and table formats byte-compatible.  Known points on the \
+scored seed: seek compactions off alone fails the gate (series); the \
+earlier single-workload reference (0.35 on mixed) fails it too; its policy \
+changes with seek compactions kept pass everywhere at 0.85.  No lower bound \
+is known."""
 solution_explanation = """
-Four changes to db/version_set.{h,cc}, db/db_impl.cc and db/version_edit.h \
-(solution/compaction.patch): (1) reads no longer schedule compactions, since a \
-seek-triggered compaction rewrites a table and everything it overlaps one \
-level down without reducing the data; (2) size-triggered compactions at \
-level >= 1 pick the file whose overlap with the next level, relative to its \
-own size, is smallest instead of the next one in key order; (3) every \
-compaction classifies entries as fresh (written since the previous \
-compaction into the same level) or old and records each output's fresh \
-fraction in memory, and the selection prefers cold files, because a file \
-still receiving updates is rewritten by the next merge into its level \
-anyway and pushing it down only moves soon-to-be garbage; (4) compaction \
-outputs are cut at grandparent file boundaries once they reach a quarter of \
-the target file size, so that when they are compacted down later they \
-overlap whole files only.  On the scored seed the reference writes WA 4.93 \
-against the untouched 14.10 (write_amp_ratio 0.350), with level-0 depth 4, \
-peak space 1.15x and phase-F read bytes 1.00x of the baseline."""
+No reference solution is shipped, so there is no solve bar; the score is \
+open-ended.  scripts/sample_candidate.patch is a known-valid engine used by \
+scripts/docker_failure_paths.sh: min-overlap-per-byte file selection scaled \
+by an in-memory hotness estimate, and outputs cut at grandparent file \
+boundaries once they reach a quarter of the target size, with seek \
+compactions left on.  It passes every gate and scores 0.853 (mixed 0.773, \
+uniform 0.819, series 0.983, blob 0.850).  scripts/old_reference.patch, \
+the earlier single-workload reference, also disables seek compactions: it \
+reaches 0.35 on mixed but fails the series read and time guardrails."""
 verification_explanation = """
 A separate verifier image carries the sealed pristine source, the fixtures \
 and the harness.  It builds the pristine engine (as root) and the candidate \
@@ -90,7 +89,8 @@ continues, the pristine reads the result, the directory is consistent; (4) \
 five sealed pristine-written databases (clean, live WAL, torn WAL, \
 reuse_logs, filterless 16 KB-block tables) plus a fresh-seed one, read and \
 extended by the candidate and read back by the pristine; (5) the full \
-workload at a fixed sealed seed for both engines: bytes written \
+workloads (mixed, uniform, series, blob) at a fixed sealed seed for both \
+engines: bytes written \
 are read from /proc/<pid>/io of the stopped harness process (then killed, so \
 no atexit code runs), divided by the logical bytes computed by the pristine \
 harness; cross reads at full scale; guardrails from a Python replay of the \
@@ -98,8 +98,9 @@ MANIFEST history (level-0 depth, peak space, file count and size, memtable \
 switches) and from the kernel (phase-F read bytes, peak RSS, wall time).  \
 reward.txt (= gate_passed) is 1 when every stage and every guardrail hold, \
 which the untouched tree does.  The objective write_amp_ratio is the \
-candidate's write amplification over the pristine's from the same run, so \
-the untouched tree scores exactly 1.0 (same code, same seed, same bytes); \
+geometric mean of candidate WA / pristine WA over the four workloads from \
+the same run, so the untouched tree scores 1.0 (same code, same seed; \
+within ~1e-4, see README); the guardrails and cross reads apply per workload; \
 it is reported as 1.0 whenever the gate fails.  Both reward files are \
 written with reward 0 first and rewritten at the end."""
 category = "Software"
@@ -117,24 +118,26 @@ paradigm = "performance"
 # reward == gate_passed: builds, all correctness stages pass and the
 # guardrails hold. The untouched tree passes.
 #
-# write_amp_ratio = candidate WA / pristine WA, both measured in the same run
-# at a fixed seed. Untouched: exactly 1.0 (WA 14.10 both, measured twice).
-# Reference: 0.350 (WA 4.93). Reported as 1.0 when the gate fails. write_amp,
-# baseline_write_amp and wa_reduction are informational.
+# write_amp_ratio = geometric mean over mixed/uniform/series/blob of
+# candidate WA / pristine WA, measured in the same run at a fixed seed.
+# Untouched: 1.0 (Harbor nop twice: 1.0 and 1.00002; series can wobble ~1e-4). No reference is shipped, so there
+# is no solve bar. Reported as 1.0 when the gate fails, as are the
+# informational write_amp_ratio_<workload> keys; write_amp and
+# baseline_write_amp are geometric means of the absolute WAs.
 gate = { key = "gate_passed" }
 objectives = [
   { key = "write_amp_ratio", direction = "lower", baseline = 1.0, tolerance = 0.01, tolerance_kind = "abs", unit = "x" },
 ]
-# Harbor oracle runs took ~6 min end to end on a 16-core desktop; the
-# platform's machines can be several times slower.
-verifier_runtime_sec = 1800
+# ~4 min end to end on a 16-core desktop for the untouched tree (233 s); a
+# slow candidate and the platform's slower machines need the headroom.
+verifier_runtime_sec = 2700
 # apt + untar only, no compiling.
 build_runtime_sec = 1800
 self_check = "/app/bench/bench.py"
 
 [verifier]
-# ~6 min locally, but the platform's machines can be a lot slower.
-timeout_sec = 3600.0
+# ~4 min locally; slow candidates and slower machines need the headroom.
+timeout_sec = 5400.0
 environment_mode = "separate"
 
 [verifier.env]

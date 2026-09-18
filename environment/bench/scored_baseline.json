@@ -1,0 +1,39 @@
+{
+  "note": "Pristine engine on the verifier's scored seed, scale 3, per workload. The verifier measures it again on every run.",
+  "mixed": {
+    "wa": 14.0985,
+    "logical_bytes": 730489699,
+    "max_total_bytes": 419228711,
+    "max_files": 184,
+    "memtable_switches": 208,
+    "read_bytes_f": 1441865850,
+    "table_bytes_present": 373130836
+  },
+  "uniform": {
+    "wa": 10.4356,
+    "logical_bytes": 555695183,
+    "max_total_bytes": 245374509,
+    "max_files": 117,
+    "memtable_switches": 156,
+    "read_bytes_f": 1152005524,
+    "table_bytes_present": 243052227
+  },
+  "series": {
+    "wa": 4.3264,
+    "logical_bytes": 597752632,
+    "max_total_bytes": 531598034,
+    "max_files": 278,
+    "memtable_switches": 179,
+    "read_bytes_f": 4519052859,
+    "table_bytes_present": 531598034
+  },
+  "blob": {
+    "wa": 4.9965,
+    "logical_bytes": 631631910,
+    "max_total_bytes": 419214328,
+    "max_files": 156,
+    "memtable_switches": 152,
+    "read_bytes_f": 1882981412,
+    "table_bytes_present": 416423950
+  }
+}
