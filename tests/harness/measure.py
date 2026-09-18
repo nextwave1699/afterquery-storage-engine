@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Run one harness process and report the kernel's view of it.
-
-Runs as the same (unprivileged) user as the harness.  The harness is started
-with --stop-at-end: on success it stops itself (SIGSTOP) instead of exiting,
-this helper reads /proc/<pid>/io (bytes passed to write(2)/read(2) by every
-thread of the process, maintained by the kernel), /proc/<pid>/status (peak
-RSS) and then kills it with SIGKILL, so nothing that runs after main()
-(atexit handlers, static destructors) can add or hide I/O.  The rusage of
-the reaped child gives the peak RSS again and the CPU time.
+"""Run a harness command and record its I/O counters from the kernel.
 
 usage: measure.py OUT.json TIMEOUT_SEC -- cmd args...
-Output JSON: stopped (bool), exit_status, signal, wchar, rchar, write_bytes,
-read_bytes, maxrss_kb, utime, stime, wall_s, timed_out.
+
+The command gets --stop-at-end appended, so on success lsmbench SIGSTOPs
+itself instead of exiting. We read /proc/<pid>/io and VmHWM while it's
+stopped, then SIGKILL it, so nothing after main() can touch the counters.
+CPU time and maxrss come from wait4().
+
+Writes a JSON object with: stopped, timed_out, exit_status, signal, wchar,
+rchar, write_bytes, read_bytes, maxrss_kb, vmhwm_kb, utime, stime, wall_s.
 """
 import json
 import os
@@ -30,7 +28,7 @@ def main():
               "wchar": 0, "rchar": 0, "write_bytes": 0, "read_bytes": 0,
               "maxrss_kb": 0, "utime": 0.0, "stime": 0.0, "wall_s": 0.0}
     t0 = time.time()
-    # New session so a timeout can kill the whole process group.
+    # own session so a timeout can kill the whole group
     p = subprocess.Popen(cmd, start_new_session=True)
     deadline = t0 + timeout
     info = None

@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
-"""Verifier for the storage-engine task.  Runs as root inside the verifier
-container; everything that executes candidate code runs as the unprivileged
-user `lsm`.
+"""Verifier driver for the storage-engine task.
 
-Pipeline (each stage is skipped when a stage it depends on failed):
+Runs as root; anything that builds or links candidate code runs as the
+unprivileged `lsm` user. Stages, each skipped if one it needs failed:
 
-  build      pristine engine + harness (trusted), candidate engine (as lsm)
-             + harness compiled from the verifier's own sources against it
-  functional selftest through the public API
-  differential  small workload: candidate writes, pristine reads; pristine
-             writes, candidate reads; every read checked against the model
-  crash      SIGKILL at engine events (WAL append, table close, manifest
-             append, obsolete-file removal, mid-table write, CURRENT rename
-             during reopen, recovery); both engines recover and agree; the
-             directory is left consistent; torn WAL tail
-  compat     sealed databases written by the pristine engine (clean close,
-             live WAL, torn WAL, reuse_logs, plain tables) plus one generated
-             with a fresh seed; candidate reads them, extends them, pristine
-             reads the result
-  benchmark  the fixed workload at full scale with a seed drawn now: pristine
-             and candidate, kernel-measured bytes written / logical bytes;
-             cross reads; shape guardrails from the MANIFEST history
-  threshold  write amplification <= WA_MAX and every guardrail
+  build         pristine + candidate engines, our own lsmbench against each
+  functional    lsmbench selftest on the candidate
+  differential  scale 0.25, each engine reads what the other wrote
+  crash         SIGKILL at various Env events, both engines must recover
+                the same batches (see CRASH_SCENARIOS)
+  compat        sealed pristine-written dbs + one fresh one: candidate reads
+                and extends, pristine reads the result
+  benchmark     full workload, fresh seed, both engines; WA from the kernel
+                counters, guardrails from the MANIFEST history
 
-Everything is written to the report (--out) incrementally; the reward files
-are produced by test.sh from the report and pytest.
+The report (--out) is rewritten after every stage. test.sh turns it into
+the reward files via test_outputs.py.
 """
 import argparse
 import json
@@ -43,10 +34,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "harness"))
 import manifest  # noqa: E402
 
-# ------------------------------------------------------------------ contract
 
-WA_MAX = 5.40                  # the bar: total bytes written / logical bytes
-BASELINE_WA_BAND = (11.0, 22.0)  # sanity band for the pristine engine
+WA_MAX = 5.40                  # bytes written / logical bytes
+BASELINE_WA_BAND = (11.0, 22.0)  # if pristine lands outside this, something is off with the box
 BENCH_SCALE = 3.0
 SMALL_SCALE = 0.25
 CRASH_SCALE = 0.3
@@ -57,11 +47,11 @@ READ_RATIO_MAX = 1.5           # phase-F bytes read vs. pristine
 FILES_RATIO_MAX = 3.0          # peak file count vs. pristine
 MAX_FILE_SIZE = 8 * 1024 * 1024
 RSS_EXTRA_MAX_KB = 96 * 1024   # peak RSS vs. pristine
-# Unreferenced tables may linger until the next compaction or open (LevelDB
-# only removes files no live version uses), but never accumulate.
+# LevelDB can leave unreferenced tables around until the next compaction or
+# open, so allow some, just not a pile.
 ORPHAN_RATIO_MAX = 0.5
 ORPHAN_SLACK = 16 * 1024 * 1024
-DISK_RATIO_MAX = 1.5           # table bytes on disk after the run vs. pristine (gross garbage)
+DISK_RATIO_MAX = 1.5           # table bytes on disk after the run vs. pristine
 MEMTABLE_SWITCH_RATIO_MIN = 0.8
 TIME_RATIO_MAX = 4.0           # wall time vs. pristine (plus 60 s)
 BUILD_TIMEOUT = int(os.environ.get("LSM_BUILD_TIMEOUT", "900"))
@@ -98,7 +88,6 @@ class Verifier:
         self.report["seed"] = self.seed
         self.t0 = time.time()
 
-    # ---------------------------------------------------------------- utils
 
     def log(self, msg):
         line = "[%6.1fs] %s" % (time.time() - self.t0, msg)
@@ -118,7 +107,7 @@ class Verifier:
         return self.report["stages"].get(name, {}).get("ok") is True
 
     def own(self, path):
-        """Give `path` (recursively) to the unprivileged user."""
+        """chown -R to the unprivileged user."""
         if self.uid is None:
             return
         for root, dirs, files in os.walk(path):
@@ -144,7 +133,7 @@ class Verifier:
                        stderr=subprocess.DEVNULL)
 
     def run_as_user(self, cmd, timeout, cwd=None, log_name=None, as_root=False):
-        """Run a command as the unprivileged user; returns (status, stdout, stderr)."""
+        """Returns (status, stdout, stderr). status is "timeout" on timeout."""
         kw = {}
         if self.uid is not None and not as_root:
             kw = {"user": self.uid, "group": self.gid}
@@ -167,8 +156,7 @@ class Verifier:
         return status, out, err
 
     def measured(self, name, cmd, timeout):
-        """Run a harness command through measure.py as the user; returns the
-        measurement dict plus stdout/stderr."""
+        """Run cmd under measure.py and return its JSON plus the output."""
         out_json = os.path.join(self.work, "meas", name + ".json")
         if os.path.exists(out_json):
             os.remove(out_json)
@@ -181,7 +169,7 @@ class Verifier:
             try:
                 with open(out_json) as f:
                     m = json.load(f)
-            except Exception as e:  # noqa
+            except Exception as e:
                 m = {"error": "unreadable measurement: %s" % e}
         else:
             m = {"error": "no measurement (helper status %s): %s" % (status, err[-500:])}
@@ -241,9 +229,8 @@ class Verifier:
         return dst
 
     def hygiene(self, db, what):
-        """Directory consistency: metadata parses, every referenced table is
-        present with its recorded size, unreferenced leftovers are bounded,
-        no obsolete WAL accumulates.  Returns the summary."""
+        """Fail if the MANIFEST points at missing/resized tables or the
+        directory is littered with orphans or old WALs."""
         info = manifest.summarize(db)
         if info["missing_tables"]:
             raise Fail("%s: manifest references missing tables %s" % (what, info["missing_tables"][:5]))
@@ -263,14 +250,12 @@ class Verifier:
             raise Fail("describe failed: %s" % err[-300:])
         return json.loads(out.strip().splitlines()[-1])
 
-    # ---------------------------------------------------------------- stages
 
     def build(self):
         st = self.report["stages"]["build"] = {"ok": None}
         os.makedirs(os.path.join(self.work, "logs"), exist_ok=True)
         os.makedirs(os.path.join(self.work, "meas"), exist_ok=True)
         self.own(os.path.join(self.work, "meas"))
-        # Pristine tree from the sealed archive.
         pristine = os.path.join(self.work, "pristine")
         unpack = os.path.join(self.work, "unpack")
         for d in (pristine, unpack):
@@ -285,7 +270,7 @@ class Verifier:
         self.log("building pristine engine")
         self.ref_bin = self.build_engine(pristine, os.path.join(self.work, "build-ref"), "ref", as_root=True)
         st["pristine_build_ok"] = True
-        # Candidate tree: copy, give to the user, build as the user.
+        # Build the candidate from a copy owned by lsm.
         if not os.path.isfile(os.path.join(self.tree, "db", "version_set.cc")):
             raise Fail("candidate tree %s is missing db/version_set.cc" % self.tree)
         cand = os.path.join(self.work, "cand")
@@ -317,7 +302,7 @@ class Verifier:
         if status != 0 or not os.path.isfile(lib):
             raise Fail("build failed for %s (status %s): %s" % (tag, status, (out + err)[-1500:]))
         self.kill_user_procs()
-        # The harness is always compiled by the verifier from its own sources.
+        # Always our copy of the harness, never the one in /app/bench.
         binary = os.path.join(self.work, "lsmbench-" + tag)
         hs = os.path.join(HERE, "harness")
         cc = ["g++", "-std=c++17", "-O2", "-fno-rtti", "-I" + os.path.join(tree, "include"), "-I" + hs,
@@ -365,9 +350,9 @@ class Verifier:
         st["ok"] = True
 
     CRASH_SCENARIOS = [
-        # name, extra run args.  --arm-at-batch N starts counting events after
-        # batch N was acknowledged; EVENT:K kills before the K-th event (":after"
-        # right after it).  The points fall in different flush/compaction cycles.
+        # --arm-at-batch N starts counting once batch N is acked, then
+        # EVENT:K kills before the K-th such event (":after" = just after it).
+        # Batch numbers are spread out so each lands in a different cycle.
         ("wal-append", ["--arm-at-batch", "20000", "--crash", "log_append:40"]),
         ("table-close", ["--arm-at-batch", "20000", "--crash", "table_close:1"]),
         ("before-manifest", ["--arm-at-batch", "22000", "--crash", "manifest_append:1"]),
@@ -401,8 +386,8 @@ class Verifier:
                 raise Fail("crash %s: crashed after %d batches, outside the armed window" % (name, acked))
             expect = acked
             if name == "torn-wal":
-                # Simulate a torn write: cut the tail of the live WAL.  Only
-                # the last record may be lost.
+                # Chop the end off the newest WAL. That should cost us the
+                # last record and nothing else.
                 logs = [n for n in os.listdir(db) if n.endswith(".log")]
                 logs.sort(key=lambda n: int(n.split(".")[0]))
                 if not logs:
@@ -415,27 +400,24 @@ class Verifier:
                     f.truncate(size - 5)
                 sc["truncated"] = logs[-1]
                 expect = acked - 1
-            # 1. The pristine engine recovers the candidate's crashed directory
-            #    (its WAL, MANIFEST, CURRENT, tables) on a copy.
+            # pristine recovers a copy of the crashed dir first
             copy = self.copy_db(db, "db-crash-%s-refcopy" % name)
             a_ref, _, _ = self.check("ref", copy, seed, scale, expect, name="crash-%s-ref" % name)
             shutil.rmtree(copy, ignore_errors=True)
-            # 2. The candidate recovers, is checked, continues, closes.
+            # then the candidate recovers the original and keeps writing
             a_cand, final, _ = self.check("cand", db, seed, scale, expect, cont=3000, name="crash-%s-cand" % name)
             sc["recovered"] = a_cand
             if a_cand != a_ref:
                 raise Fail("crash %s: pristine recovered %d batches, candidate %d" % (name, a_ref, a_cand))
             if final is None or final < a_cand + 1:
                 raise Fail("crash %s: candidate did not continue after recovery" % name)
-            # 3. Pristine reads the continued database, candidate reopens it after that.
+            # and both can still open what it left behind
             a2, _, _ = self.check("ref", db, seed, scale, final, name="crash-%s-ref2" % name)
             if a2 != final:
                 raise Fail("crash %s: pristine reads %d batches after continuation, expected %d" % (name, a2, final))
             a3, _, _ = self.check("cand", db, seed, scale, final, name="crash-%s-cand2" % name)
             if a3 != final:
                 raise Fail("crash %s: candidate reads %d batches after the pristine reopen, expected %d" % (name, a3, final))
-            # 4. Directory hygiene: metadata parses, every referenced table
-            #    exists, nothing unreferenced or stale is left behind.
             info = self.hygiene(db, "crash %s" % name)
             sc["layout"] = info["levels"]
             sc["orphans"] = len(info["orphan_tables"])
@@ -453,7 +435,7 @@ class Verifier:
             tf.extractall(fx_dir)
         with open(os.path.join(fx_dir, "fixtures.json")) as f:
             fixtures = json.load(f)
-        # A fixture produced right now by the pristine engine with a fresh seed.
+        # plus one written right now with a seed nobody has seen
         fresh_seed = self.seed + 11
         fresh = os.path.join(fx_dir, "fresh")
         os.makedirs(fresh)
@@ -502,7 +484,7 @@ class Verifier:
                              timeout=RUN_TIMEOUT, name="bench-%s-run" % which)
             self.expect_ok(m, "%s benchmark run" % which)
             r["run"] = strip(m)
-            info_run = self.hygiene(db, "%s benchmark run" % which)   # history of the whole run
+            info_run = self.hygiene(db, "%s benchmark run" % which)
             r["manifest_run"] = {k: info_run[k] for k in ("levels", "level_bytes", "max_l0", "max_l0_depth",
                                                           "max_files", "max_file_size", "max_total_bytes",
                                                           "mean_total_bytes", "edits", "files_added", "bytes_added",
@@ -520,8 +502,7 @@ class Verifier:
             self.log("%s: write amplification %.3f (%.0f MB written / %.0f MB logical), phase F read %.0f MB, rss %d MB, %.0fs" % (
                 which, r["wa"], r["written"] / 1e6, logical / 1e6, r["read_bytes_f"] / 1e6, r["maxrss_kb"] // 1024, r["wall_s"]))
             self.save()
-        # cross reads at full scale: pristine reads the candidate's database
-        # and the candidate reads the pristine's.
+        # cross reads at full scale
         a, _, _ = self.check("ref", os.path.join(self.work, "db-bench-cand"), seed, scale, desc["batches"],
                              name="bench-ref-reads-cand", timeout=RUN_TIMEOUT)
         if a != desc["batches"]:
@@ -536,7 +517,6 @@ class Verifier:
         st["candidate_wa"] = cand["wa"]
         if not (BASELINE_WA_BAND[0] <= base["wa"] <= BASELINE_WA_BAND[1]):
             raise Fail("verifier self-check: pristine write amplification %.2f outside %s" % (base["wa"], BASELINE_WA_BAND))
-        # ---- guardrails
         g = st["guardrails"] = {}
         mr_b, mr_c = base["manifest_run"], cand["manifest_run"]
         g["max_l0_depth"] = mr_c["max_l0_depth"]
@@ -576,7 +556,6 @@ class Verifier:
         self.log("candidate WA %.3f (bar %.2f, baseline %.3f): %s" % (
             cand["wa"], WA_MAX, base["wa"], "target reached" if st["target_reached"] else "target NOT reached"))
 
-    # ---------------------------------------------------------------- driver
 
     def run(self):
         self.save()
@@ -639,7 +618,7 @@ class _Stage:
             self.v.log("stage %s: FAILED: %s" % (self.name, st["error"][:500]))
         self.v.kill_user_procs()
         self.v.save()
-        return True  # never propagate
+        return True  # swallow it; the stage is marked failed
 
 
 def describe_failure(m):
@@ -672,7 +651,8 @@ def main():
     v = Verifier(args)
     try:
         return v.run()
-    except Exception:  # noqa: last resort: still leave a report
+    except Exception:
+        # bug in the driver itself; still leave a reward-0 report behind
         v.report["fatal"] = traceback.format_exc()
         v.report.setdefault("summary", {"reward": 0, "correctness_passed": False,
                                         "guardrails_passed": False, "target_reached": False})

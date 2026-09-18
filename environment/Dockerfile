@@ -1,15 +1,11 @@
-# The agent's image.
+# Agent image.
 #
-# /app/leveldb    the deliverable: LevelDB 1.23 (commit 99b3c03b) with its
-#                 googletest/benchmark submodules vendored, unpacked from the
-#                 sealed archive and committed once to git (tag `pristine`)
-# /opt/pristine   a second copy of the same tree, left untouched; bench.py
-#                 builds it on first use as the baseline
-# /app/bench      the benchmark harness and workload (byte copies of what the
-#                 verifier runs) and bench.py, which estimates the score
+#   /app/leveldb   LevelDB 1.23 (99b3c03b) with submodules vendored, in a git
+#                  repo tagged `pristine`; this is what gets collected
+#   /opt/pristine  untouched copy, bench.py builds it as the baseline
+#   /app/bench     same harness sources the verifier uses, plus bench.py
 #
-# Nothing is compiled at image build time and nothing is fetched except apt
-# packages.
+# Nothing gets compiled here; the only download is apt.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

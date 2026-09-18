@@ -15,7 +15,7 @@ brief is `instruction.md`.
 |---|---|
 | `environment/` | agent image: toolchain, `/app/leveldb` (pristine tree with vendored googletest/benchmark, git tag `pristine`), `/opt/pristine` (untouched copy), `/app/bench` (byte copies of the harness + `bench.py`) |
 | `environment/sealed/leveldb.tar.gz` | the pinned source, built by `scripts/seal.sh` |
-| `tests/` | verifier image, `test.sh`, `verify.py` (driver), `test_outputs.py` (verdict), `harness/` (single source of truth for the harness), `sealed/` (source + fixtures) |
+| `tests/` | verifier image, `test.sh`, `verify.py` (driver), `test_outputs.py` (verdict), `harness/` (the harness; `environment/bench` is a copy), `sealed/` (source + fixtures) |
 | `solution/` | reference solution: `compaction.patch` + `solve.sh` |
 | `cheat/README.md` | shortcuts considered and why the verifier rejects them (never executed by the pipeline) |
 | `scripts/` | `seal.sh` (rebuild the archives and fixtures), `gen_fixtures.sh`, `docker_failure_paths.sh` (17 trees through the verifier image) |
@@ -57,7 +57,7 @@ bytes, file count and size, memtable switches.
    after MANIFEST appends, before an obsolete-file removal, mid-table,
    mid-compaction, after a compaction is installed, reopen before the
    CURRENT rename, crash during recovery, torn WAL tail): acknowledged
-   batches recovered by the candidate **and** by the pristine engine on the
+   batches recovered by the candidate and by the pristine engine on the
    same directory, candidate continues, pristine reads, candidate reopens,
    directory consistent (no missing tables, bounded leftovers);
 5. compatibility: five sealed pristine-written fixtures (clean, live WAL,

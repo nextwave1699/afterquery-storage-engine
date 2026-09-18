@@ -110,10 +110,8 @@ Args ParseArgs(int argc, char** argv) {
   return a;
 }
 
-// ---------------------------------------------------------------- options
-
-// The database configuration is fixed: the same options for the baseline and
-// the candidate, chosen so that the workload produces several levels.
+// Same options for both engines. Small buffers and files so the workload
+// reaches several levels.
 struct DbResources {
   std::unique_ptr<leveldb::Cache> cache;
   std::unique_ptr<const leveldb::FilterPolicy> filter;
@@ -150,8 +148,6 @@ leveldb::Options MakeOptions(BenchEnv* env, DbResources* res, bool create,
   o.info_log = res->logger.get();
   return o;
 }
-
-// ---------------------------------------------------------------- runner
 
 class Runner {
  public:
@@ -231,12 +227,12 @@ class Runner {
     }
   }
 
-  // Full verification of the database against the model, tolerating one
-  // in-flight batch (`inflight`: id -> version before the batch).  Returns
-  // true if the in-flight batch was found applied.
+  // Checks the whole database against the model. One in-flight batch is
+  // allowed to be either applied or not (the two maps hold its ids' versions
+  // before and after it). Returns true if it was applied.
   bool Verify(const std::map<uint64_t, uint32_t>& inflight_before,
               const std::map<uint64_t, uint32_t>& inflight_after) {
-    // Forward scan of everything, deciding the in-flight question on the way.
+    // Forward scan first; this also decides whether the in-flight batch landed.
     int inflight_state = -1;  // -1 unknown, 0 old, 1 new
     auto decide = [&](uint64_t id, const leveldb::Slice* value, bool found) {
       auto ib = inflight_before.find(id);
@@ -261,7 +257,7 @@ class Runner {
     while (true) {
       if (!it->Valid()) {
         if (!it->status().ok()) Die(kExitEngine, "iterator: " + it->status().ToString());
-        // Remaining expected ids must be absent.
+        // Nothing left in the db, so the rest of the ids must be dead.
         while (expect < model_.ver.size()) {
           if (inflight_before.count(expect)) {
             decide(expect, nullptr, false);
@@ -503,8 +499,6 @@ class Runner {
   uint64_t gets_ = 0, scans_ = 0, scanned_entries_ = 0, opens_ = 0;
 };
 
-// ---------------------------------------------------------------- stats
-
 void WriteStats(const Args& a, BenchEnv* env, Runner* r, uint64_t elapsed_ms,
                 const char* extra_key, uint64_t extra_val) {
   if (a.stats.empty()) return;
@@ -563,8 +557,6 @@ uint64_t NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-
-// ---------------------------------------------------------------- modes
 
 int Describe(const Args& a) {
   Workload wl(a.seed, a.scale);
@@ -816,10 +808,9 @@ int SelfTest(const Args& a) {
 
 }  // namespace
 
-// With --stop-at-end a successful run ends by stopping the process
-// (SIGSTOP) instead of exiting: the driver reads the kernel's I/O counters
-// of the stopped process and then kills it, so nothing that runs after
-// main() (atexit handlers, static destructors) can add or hide I/O.
+// --stop-at-end: on success, SIGSTOP ourselves instead of exiting.
+// measure.py reads /proc/<pid>/io while we're stopped and then kills us,
+// so atexit handlers and static destructors never get to do any I/O.
 void Finish(const Args& a, int code) {
   fflush(stdout);
   fflush(stderr);

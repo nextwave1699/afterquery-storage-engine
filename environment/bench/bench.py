@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""Estimate the verifier's measurements for the tree in /app/leveldb.
+"""Measure /app/leveldb against /opt/pristine the way the verifier does.
 
     bench.py [--seed N] [--scale X] [--candidate-only] [--keep]
 
-Builds the untouched engine in /opt/pristine (once) and the candidate in
-/app/leveldb, compiles the harness (lsmbench.cc, this directory) against
-each, runs the fixed workload with each (phases A..E in one process, phase F
-in a second one), reads the kernel's byte counters of those processes, checks
-the candidate's database with the pristine reader and vice versa, replays
-the MANIFEST history for the shape guardrails, and prints the numbers the
-verifier would look at.  Defaults: seed 1, scale 3 (the verifier's scale;
-its seed is drawn at verification time).
+Builds both engines (pristine only once) with lsmbench from this directory,
+runs the workload on each, cross-reads the two databases and prints write
+amplification next to the guardrails. Defaults to seed 1 at scale 3, which
+is the verifier's scale; the verifier picks its own seed.
 
-This is an estimate, not the score: the verifier also runs crash-recovery
-scenarios and compatibility fixtures, on its own machine.
+It doesn't run the crash or compatibility checks, so passing here isn't a
+guarantee.
 """
 import argparse
 import json
@@ -123,7 +119,7 @@ def main():
                   info["max_total_bytes"] / 1e6, info["max_files"], info["memtable_switches"],
                   read["rchar"] / 1e6, results[tag]["rss_kb"] // 1024))
     if ref is not None:
-        print("cross reads: pristine reads the candidate's database, candidate reads the pristine's ...")
+        print("cross reads ...")
         check(ref, results["candidate"]["db"], args.seed, args.scale, desc["batches"])
         check(cand, results["pristine"]["db"], args.seed, args.scale, desc["batches"])
         print("cross reads ok")

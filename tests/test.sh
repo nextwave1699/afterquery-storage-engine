@@ -1,22 +1,16 @@
 #!/bin/bash
-# Verifier entry point.  Installs and fetches nothing: the sealed engine
-# source, the fixtures, the harness and the toolchain are baked into the
-# verifier image by tests/Dockerfile.  The only outside input is the
-# candidate's tree, which arrives as the collected artifact at /app/leveldb.
+# Verifier entry point. Everything it needs is already in the image (see
+# tests/Dockerfile); the only input from outside is the candidate tree at
+# /app/leveldb.
 #
-# Outputs under /logs/verifier:
-#   reward.txt    1 or 0: the candidate builds, every correctness stage
-#                 passes (functional, differential, crash recovery, on-disk
-#                 compatibility), every guardrail holds and the write
-#                 amplification of the fixed workload is at or below the bar
-#   reward.json   reward plus flat named metrics (write_amp, baseline_write_amp,
-#                 wa_reduction, target_reached, the stage flags, guardrails)
-#   report.json   the driver's full report
-#   pytest.txt    the pytest transcript
+# Writes to /logs/verifier:
+#   reward.txt   1 if every stage and guardrail passes and WA <= 5.40, else 0
+#   reward.json  the same reward plus flat metrics (write_amp, stage flags...)
+#   report.json  verify.py's full report
+#   pytest.txt   pytest output
 #
-# Both reward files are written fail-closed before anything else runs and
-# rewritten at the end, so every exit path -- missing tree, build failure,
-# crash, timeout, verifier bug -- leaves a parseable reward of 0.
+# We write a zero reward up front and overwrite it at the end, so if anything
+# blows up in between there's still a valid 0 on disk.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWARD_DIR="${LSM_REWARD_DIR:-/logs/verifier}"
@@ -48,18 +42,16 @@ JSON
 }
 write_zero
 
-# Whatever happens below, finish with a consistent pair of reward files.
 finish() {
   status=$1
-  # A candidate process could have replaced these paths by directories; clear them first.
+  # candidate code may have put something at these paths, so clear them
   rm -rf "${REWARD_DIR}/reward.txt" "${REWARD_DIR}/reward.json" "${REWARD_DIR}/reward.json.tmp" 2>/dev/null || true
   if [ "${status}" -eq 0 ]; then
     printf '1\n' > "${REWARD_DIR}/reward.txt"
   else
     printf '0\n' > "${REWARD_DIR}/reward.txt"
   fi
-  # reward.json: reward equals the gate; the other keys are informational
-  # and must be flat numbers.
+  # reward.json keys must all be flat numbers; only "reward" counts
   python3 - "${LSM_REPORT}" "${REWARD_DIR}/reward.json" "${status}" <<'PY' || write_zero
 import json, os, sys
 report_path, out_path, status = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -91,8 +83,7 @@ out = {
     "write_amp": wa,
     "baseline_write_amp": base,
     "wa_reduction": (1.0 - wa / base) if (wa > 0 and base > 0) else 0.0,
-    # the objective as scored: the measured write amplification once the
-    # gate is passed, otherwise 0 (no credit)
+    # only counts once the gate passes
     "scored_write_amp": wa if reward else 0.0,
 }
 tmp = out_path + ".tmp"
@@ -105,7 +96,7 @@ PY
 }
 trap 'finish 1' ERR
 
-# The driver's exit status is not the verdict; the report is, through pytest.
+# Ignore verify.py's exit code, pytest decides from the report.
 python3 "${HERE}/verify.py" \
     --tree "${TREE}" \
     --sealed "${HERE}/sealed" \

@@ -1,13 +1,11 @@
-"""Trusted reader of a LevelDB database directory's metadata.
+"""Read a LevelDB directory's CURRENT/MANIFEST without the engine.
 
-Parses CURRENT and the MANIFEST it points at (log-format records of
-VersionEdits) with no help from the engine, replays the edits and reports
-the level layout after every edit.  Used by the verifier to check the shape
-of what the candidate produced (files per level over time, file sizes,
-referenced vs. present files) and, indirectly, that the manifest format is
-the one the pristine engine writes.
+We replay the VersionEdits ourselves and keep the level layout after each
+edit, which is where the level-0 depth, peak space and file-size guardrails
+come from. Doing it in Python means a candidate can't misreport its own
+shape, and a MANIFEST we can't parse is a format change anyway.
 
-The formats (db/log_format.h, db/version_edit.cc of LevelDB 1.23):
+Format notes (db/log_format.h and db/version_edit.cc in 1.23):
 
   log block  = 32768 bytes; record header = crc32c(4) length(2) type(1)
   record types: 1 FULL, 2 FIRST, 3 MIDDLE, 4 LAST (0 = zero/padding)

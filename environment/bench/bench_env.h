@@ -1,24 +1,21 @@
-// BenchEnv: the leveldb::Env the benchmark harness hands to the engine.
+// BenchEnv is the leveldb::Env the harness gives the engine.
 //
-// It is a complete POSIX Env of its own (it delegates nothing file-related to
-// the engine's Env::Default()), so every byte the engine reads or writes goes
-// through code owned by the harness:
+// It's a standalone POSIX Env (nothing file-related goes to Env::Default()),
+// so all engine I/O passes through harness code. On top of plain file access
+// it does three things:
 //
-//   * byte counters per file kind (WAL, table, manifest, other), reads and
-//     writes, plus file create/remove counts;
-//   * a deterministic scheduler: Env::Schedule() queues work on one worker
-//     thread and the harness drains the queue after every operation, so
-//     flushes and compactions happen at the same points on every machine and
-//     the byte counts do not depend on timing;
-//   * crash injection: an optional trigger (EVENT:N or EVENT:N:after) kills
-//     the process with SIGKILL immediately before the N-th event of that kind
-//     (or right after it completed).  Events are generic Env events -- WAL
-//     append, table create/append/sync/close, manifest append/sync, file
-//     removal, rename -- so they fire for any engine built on the Env API.
+//   - counts bytes read/written per file kind (log, table, manifest, other)
+//     and files created/removed;
+//   - runs Env::Schedule() work on a single worker that the harness drains
+//     after every operation, so flushes and compactions land at the same
+//     points on every machine and byte counts don't depend on timing;
+//   - optionally SIGKILLs the process right before (or after) the N-th event
+//     of some kind, e.g. log_append:40 or manifest_append:1:after. Events are
+//     plain Env calls (appends, syncs, closes, removes, renames), so this
+//     works for any engine built on the Env API.
 //
-// Sync()/Flush() push user-space buffers to the OS but do not fsync: the
-// crash model is a process kill, after which everything the OS accepted is
-// still there, exactly as with a real process crash.
+// Sync()/Flush() hand buffers to the OS but don't fsync. We only simulate
+// process crashes, and data the kernel already has survives those.
 #ifndef LSMBENCH_BENCH_ENV_H_
 #define LSMBENCH_BENCH_ENV_H_
 
@@ -394,7 +391,7 @@ class BenchEnv : public leveldb::Env {
   Counters* counters() { return &counters_; }
   CrashInjector* crash() { return &crash_; }
 
-  // ---- files ----
+  // Files.
   leveldb::Status NewSequentialFile(const std::string& fname,
                                     leveldb::SequentialFile** result) override {
     int fd = ::open(fname.c_str(), O_RDONLY | O_CLOEXEC);
@@ -550,7 +547,7 @@ class BenchEnv : public leveldb::Env {
     return s;
   }
 
-  // ---- scheduling ----
+  // Scheduling.
   void Schedule(void (*function)(void*), void* arg) override {
     {
       std::lock_guard<std::mutex> l(mu_);
