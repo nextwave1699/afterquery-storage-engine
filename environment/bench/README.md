@@ -22,6 +22,7 @@ the workload (key + value of every put, key of every delete).  The kernel's
 counters are read from the stopped process, so nothing the engine reports
 is used.
 
-The workload, options and metric are the same in the verifier; only the
-seed differs (drawn at verification time; results are seed-stable to
-about 1%).
+The score is the candidate's write amplification divided by the
+pristine's (1.0 = untouched, lower is better).  The workload, options and
+metric are the same in the verifier; only the seed differs (the verifier
+uses a fixed seed of its own; results are seed-stable to about 1%).

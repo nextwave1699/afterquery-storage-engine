@@ -4,13 +4,15 @@
 # /app/leveldb.
 #
 # Writes to /logs/verifier:
-#   reward.txt   1 if every stage and guardrail passes and WA <= 5.40, else 0
-#   reward.json  the same reward plus flat metrics (write_amp, stage flags...)
+#   reward.txt   the gate: 1 if every stage and guardrail passes, else 0
+#   reward.json  gate_passed (same value), the objective write_amp_ratio, and
+#                informational metrics (write_amp, stage flags...)
 #   report.json  verify.py's full report
 #   pytest.txt   pytest output
 #
 # We write a zero reward up front and overwrite it at the end, so if anything
-# blows up in between there's still a valid 0 on disk.
+# blows up in between there's still a valid 0 on disk. write_amp_ratio is 1.0
+# (no improvement) whenever the gate is red.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWARD_DIR="${LSM_REWARD_DIR:-/logs/verifier}"
@@ -32,11 +34,10 @@ write_zero() {
   "crash_recovery_ok": 0,
   "compat_ok": 0,
   "guardrails_ok": 0,
-  "target_reached": 0,
+  "write_amp_ratio": 1.0,
   "write_amp": 0.0,
   "baseline_write_amp": 0.0,
-  "wa_reduction": 0.0,
-  "scored_write_amp": 0.0
+  "wa_reduction": 0.0
 }
 JSON
 }
@@ -69,7 +70,7 @@ def num(v, default=0.0):
 reward = 1 if status == 0 else 0
 wa = num(bench.get("candidate_wa"))
 base = num(bench.get("baseline_wa"))
-target = 1 if bench.get("target_reached") is True and reward else 0
+ratio = num(bench.get("wa_ratio"), 1.0)
 out = {
     "reward": reward,
     "gate_passed": reward,
@@ -79,12 +80,11 @@ out = {
     "crash_recovery_ok": flag("crash"),
     "compat_ok": flag("compat"),
     "guardrails_ok": 1 if bench.get("guardrails", {}).get("ok") is True else 0,
-    "target_reached": target,
+    # the objective; only meaningful when the gate passed
+    "write_amp_ratio": ratio if reward else 1.0,
     "write_amp": wa,
     "baseline_write_amp": base,
     "wa_reduction": (1.0 - wa / base) if (wa > 0 and base > 0) else 0.0,
-    # only counts once the gate passes
-    "scored_write_amp": wa if reward else 0.0,
 }
 tmp = out_path + ".tmp"
 with open(tmp, "w") as f:

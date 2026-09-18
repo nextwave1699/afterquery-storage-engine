@@ -1,6 +1,8 @@
 """Checks on the report verify.py writes to $LSM_REPORT.
 
-test.sh gives reward 1 only if all of these pass."""
+These are the gate: test.sh sets gate_passed (and reward.txt) to 1 only if
+all of them pass. They don't look at how low the write amplification is;
+that's the objective, reported separately as write_amp_ratio."""
 import json
 import os
 
@@ -55,9 +57,9 @@ def test_compat(report):
 
 
 def test_benchmark_ran(report):
-    """Full workload ran on both engines."""
+    """Full workload ran on both engines and was measured."""
     st = stage(report, "benchmark")
-    assert st.get("candidate_wa") is not None
+    assert st.get("candidate_wa") is not None and st.get("wa_ratio") is not None
 
 
 def test_guardrails(report):
@@ -66,12 +68,3 @@ def test_guardrails(report):
     g = st.get("guardrails", {})
     assert g.get("ok") is True, "guardrail failures: %s" % g.get("failures")
 
-
-def test_write_amplification(report):
-    """Write amplification is at or under the bar."""
-    st = stage(report, "benchmark")
-    wa = st.get("candidate_wa")
-    bar = report.get("contract", {}).get("wa_max")
-    assert wa is not None and bar is not None
-    assert wa <= bar, "write amplification %.3f exceeds the bar %.2f (baseline %.3f)" % (
-        wa, bar, st.get("baseline_wa") or 0.0)

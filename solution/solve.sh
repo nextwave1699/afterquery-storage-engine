@@ -21,8 +21,8 @@
 #     is at least a quarter of max_file_size, so later it overlaps whole
 #     files instead of dragging half-overlapped neighbours along.
 #
-# At scale 3 this measures about 5.0 (bar 5.4, pristine 15-16.5), L0 depth
-# 4, peak space ~1.13x, phase-F reads ~0.95x.
+# On the verifier's seed this measures WA 4.93 against the pristine 14.10
+# (write_amp_ratio 0.350), L0 depth 4, peak space 1.15x, phase-F reads 1.00x.
 set -euo pipefail
 HERE="${LSM_SOLVE_DIR}"
 TREE="${LSM_TREE:-/app/leveldb}"

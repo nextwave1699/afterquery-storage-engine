@@ -4,9 +4,10 @@
     bench.py [--seed N] [--scale X] [--candidate-only] [--keep]
 
 Builds both engines (pristine only once) with lsmbench from this directory,
-runs the workload on each, cross-reads the two databases and prints write
-amplification next to the guardrails. Defaults to seed 1 at scale 3, which
-is the verifier's scale; the verifier picks its own seed.
+runs the workload on each, cross-reads the two databases and prints the
+score (candidate WA / pristine WA, lower is better) next to the guardrails.
+Defaults to seed 1 at scale 3, which is the verifier's scale; the verifier
+scores its own fixed seed.
 
 It doesn't run the crash or compatibility checks, so passing here isn't a
 guarantee.
@@ -22,7 +23,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import manifest  # noqa: E402
 
-WA_MAX = 5.40
 MAX_L0_DEPTH = 4
 SPACE_RATIO_MAX = 1.25
 READ_RATIO_MAX = 1.5
@@ -126,7 +126,6 @@ def main():
         b, c = results["pristine"], results["candidate"]
         ib, ic = b["info"], c["info"]
         checks = [
-            ("write amplification <= %.2f" % WA_MAX, c["wa"] <= WA_MAX, "%.3f" % c["wa"]),
             ("level-0 depth <= %d" % MAX_L0_DEPTH, ic["max_l0_depth"] <= MAX_L0_DEPTH, str(ic["max_l0_depth"])),
             ("peak space <= %.2fx" % SPACE_RATIO_MAX, ic["max_total_bytes"] <= SPACE_RATIO_MAX * ib["max_total_bytes"],
              "%.2fx" % (ic["max_total_bytes"] / max(1, ib["max_total_bytes"]))),
@@ -145,12 +144,11 @@ def main():
         print()
         for name, ok, val in checks:
             print("  %-36s %-8s %s" % (name, "ok" if ok else "FAIL", val))
-        print("\nestimate: %s (baseline write amplification %.3f, reduction %.0f%%)" % (
-            "would pass" if all(ok for _, ok, _ in checks) else "would NOT pass",
-            b["wa"], 100 * (1 - c["wa"] / b["wa"])))
+        print("\nguardrails: %s" % ("ok" if all(ok for _, ok, _ in checks) else "FAIL (score would not count)"))
+        print("score: %.4f  (write amplification %.3f vs pristine %.3f, untouched = 1.0, lower is better)" % (
+            c["wa"] / b["wa"], c["wa"], b["wa"]))
         if abs(args.scale - 3.0) > 1e-9:
-            print("note: the bar applies at scale 3; write amplification is lower at smaller scales "
-                  "(fewer levels), so only a scale-3 run is comparable")
+            print("note: the verifier runs scale 3; smaller scales build fewer levels, so the score differs")
     if not args.keep:
         for r in results.values():
             shutil.rmtree(r["db"], ignore_errors=True)

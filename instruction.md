@@ -2,17 +2,17 @@
 
 `/app/leveldb` is LevelDB 1.23 (commit `99b3c03b`, googletest/benchmark vendored), a git repo whose `pristine` tag is the untouched code; `/opt/pristine` is an untouched copy. `/app/bench` holds the benchmark harness the verifier runs (`lsmbench.cc`, `workload.h`, `bench_env.h`, `manifest.py`) and `bench.py`, which builds both trees and measures them:
 
-    python3 /app/bench/bench.py            # seed 1, scale 3 (~1 min)
+    python3 /app/bench/bench.py     # seed 1, scale 3 (~1 min): score and gates
 
 ## Goal
 
 Change the engine's compaction strategy so that the fixed workload is written with far fewer bytes, while reads, crash recovery and the on-disk format stay exactly as they are.
 
-**Write amplification** = bytes the engine passes to `write(2)` (WAL, tables, MANIFEST, everything) during the workload / logical bytes of the workload (key+value of every put, key of every delete). The verifier reads the kernel's I/O counters of the harness process; nothing the engine reports is used. The untouched engine measures **about 15-16.5** on the verifier's workload. Reward 1 requires **write amplification <= 5.40** and every gate below; otherwise 0.
+**Write amplification** = bytes the engine passes to `write(2)` (WAL, tables, MANIFEST, everything) during the workload / logical bytes of the workload (key+value of every put, key of every delete). It comes from the kernel's I/O counters, not from anything the engine reports. Score = your write amplification / the pristine engine's, both measured in the same verifier run: untouched is 1.0 (about 14 WA), lower is better. It only counts if every gate below passes (the untouched tree passes them).
 
 ## Workload
 
-`workload.h`: ~730 MB of writes in phases (sequential load; random-order inserts; updates concentrated in one hot key range; deletes purging a contiguous range in key order plus random deletes; a mixed phase with a hot window sliding across the key space), with point reads, range scans and snapshot reads interleaved, then a read-only phase (point reads, forward/reverse scans, full scan) in a separate process. Every read is checked against an in-memory model. Fixed options: 4 MB write buffer, 2 MB target file size, 4 KB blocks, 8 MB block cache, 10-bit bloom filter, no compression. The seed is drawn at verification time; results are seed-stable to ~1%.
+`workload.h`: ~730 MB of writes in phases (sequential load; random-order inserts; updates concentrated in one hot key range; deletes purging a contiguous range in key order plus random deletes; a mixed phase with a hot window sliding across the key space), with point reads, range scans and snapshot reads interleaved, then a read-only phase (point reads, forward/reverse scans, full scan) in a separate process. Every read is checked against an in-memory model. Fixed options: 4 MB write buffer, 2 MB target file size, 4 KB blocks, 8 MB block cache, 10-bit bloom filter, no compression. The score uses one fixed seed you are not given; results are seed-stable to ~1%.
 
 The harness supplies its own `leveldb::Env`: it counts bytes, runs `Env::Schedule` work on one worker thread that is drained after every operation (so flushes and compactions happen at deterministic points), and kills the process at chosen Env events for the crash tests.
 
@@ -21,7 +21,7 @@ The harness supplies its own `leveldb::Env`: it counts bytes, runs `Env::Schedul
 1. Builds with the tree's CMake (`-DLEVELDB_BUILD_TESTS=OFF`); the harness compiles against `include/`.
 2. Small workload: candidate writes, pristine reads; pristine writes, candidate reads and extends. Every read correct.
 3. Crash recovery: SIGKILL at WAL append, table close, before/after a MANIFEST append, before an obsolete-file removal, mid-table write, mid-compaction, during reopen (before the CURRENT rename, after the recovery MANIFEST) and a torn WAL tail. Acknowledged batches must be recovered (the batch in flight may or may not be), by the candidate and by the pristine engine opening the same directory; the candidate continues writing; the pristine reads the result; no missing, unreferenced or stale files remain.
-4. Compatibility: sealed databases written by the pristine engine (clean close, live WAL, torn WAL, `reuse_logs`, tables without filter and with 16 KB blocks) and one generated at verification time must be read and extended by the candidate, then read by the pristine.
+4. Compatibility: sealed databases written by the pristine engine (clean close, live WAL, torn WAL, `reuse_logs`, tables without filter and with 16 KB blocks) and a fresh one must be read and extended by the candidate, then read by the pristine.
 5. Guardrails on the full workload, from the MANIFEST history and the kernel: at no version more than **4 level-0 files overlapping one key** (the baseline's trigger); peak table bytes <= 1.25x baseline; phase-F bytes read <= 1.5x; peak file count <= 3x; no table over 8 MB; peak RSS <= baseline + 96 MB; at least 0.8x the baseline's memtable switches (honour `write_buffer_size`); wall time <= 4x baseline + 60 s.
 
 ## Constraints

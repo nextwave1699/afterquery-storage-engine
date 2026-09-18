@@ -1,7 +1,8 @@
 #!/bin/bash
-# Runs the verifier image against deliberately broken, cheating or merely
-# insufficient trees and checks that every one of them yields reward 0 with
-# both reward files present, plus nop (0) and oracle (1).
+# Runs the verifier image against deliberately broken or cheating trees and
+# checks that each gets gate 0 with both reward files present. nop, oracle
+# and seek-only are valid engines, so they must get gate 1 (the objective
+# write_amp_ratio is printed: 1.0, ~0.35, ~0.43).
 #
 # usage: scripts/docker_failure_paths.sh [case ...]     (default: all)
 # Needs the image built:  docker build -t lsm-verifier tests
@@ -105,7 +106,7 @@ s=s.replace(old,"               (mem_->ApproximateMemoryUsage() <= 64u * 1024 * 
 open(p,"w").write(s)
 EOF
       ;;
-    seek-only)  # the trivial change alone: no seek compactions (~6.1, above the bar)
+    seek-only)  # the trivial change alone: no seek compactions (valid, ratio ~0.43)
       python3 - "$t/db/version_set.cc" <<'EOF'
 import sys; p=sys.argv[1]; s=open(p).read()
 old="bool Version::UpdateStats(const GetStats& stats) {\n  FileMetaData* f = stats.seek_file;\n  if (f != nullptr) {"
@@ -150,7 +151,8 @@ run_case() {
   docker run --rm "${mount[@]}" -v "$logs:/logs/verifier" "${extra[@]}" "$IMAGE" bash /tests/test.sh > "$logs/run.log" 2>&1
   local reward="?" ; [ -f "$logs/reward.txt" ] && reward=$(cat "$logs/reward.txt")
   local jok="missing"; [ -f "$logs/reward.json" ] && jok=$(python3 -c "import json;print(json.load(open('$logs/reward.json'))['reward'])" 2>/dev/null || echo bad)
-  local expect=0; [ "$name" = oracle ] && expect=1
+  local expect=0
+  case "$name" in nop|oracle|seek-only) expect=1 ;; esac
   local why; why=$(python3 -c "
 import json
 try:
@@ -158,7 +160,7 @@ try:
     st=r.get('stages',{})
     bad=[k+': '+str(v.get('error',''))[:90] for k,v in st.items() if v.get('ok') is False]
     b=st.get('benchmark',{})
-    print('; '.join(bad) or ('wa=%.3f guard=%s' % (b.get('candidate_wa') or 0, b.get('guardrails',{}).get('failures'))))
+    print('; '.join(bad) or ('ratio=%.4f wa=%.3f guard=%s' % (b.get('wa_ratio') or 0, b.get('candidate_wa') or 0, b.get('guardrails',{}).get('failures'))))
 except Exception as e: print('no report: %s' % e)
 " 2>&1)
   local verdict=PASS; { [ "$reward" = "$expect" ] && [ "$jok" = "$expect" ]; } || verdict=FAIL

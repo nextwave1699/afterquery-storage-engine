@@ -11,8 +11,12 @@ unprivileged `lsm` user. Stages, each skipped if one it needs failed:
                 the same batches (see CRASH_SCENARIOS)
   compat        sealed pristine-written dbs + one fresh one: candidate reads
                 and extends, pristine reads the result
-  benchmark     full workload, fresh seed, both engines; WA from the kernel
+  benchmark     full workload at BENCH_SEED, both engines; WA from the kernel
                 counters, guardrails from the MANIFEST history
+
+The gate is every stage plus the guardrails, which the untouched tree passes.
+The score is write_amp_ratio = candidate WA / pristine WA from this same run
+(untouched: 1.0, lower is better).
 
 The report (--out) is rewritten after every stage. test.sh turns it into
 the reward files via test_outputs.py.
@@ -35,7 +39,9 @@ sys.path.insert(0, os.path.join(HERE, "harness"))
 import manifest  # noqa: E402
 
 
-WA_MAX = 5.40                  # bytes written / logical bytes
+# The scored benchmark always uses this seed, so repeat runs measure the
+# same bytes. It lives only here; bench.py defaults to seed 1.
+BENCH_SEED = 604729
 BASELINE_WA_BAND = (11.0, 22.0)  # if pristine lands outside this, something is off with the box
 BENCH_SCALE = 3.0
 SMALL_SCALE = 0.25
@@ -71,7 +77,7 @@ class Verifier:
         self.work = args.work
         self.user = args.user or None
         self.report = {"stages": {}, "log": [], "contract": {
-            "wa_max": WA_MAX, "bench_scale": BENCH_SCALE, "max_l0_depth": MAX_L0_DEPTH,
+            "bench_seed": BENCH_SEED, "bench_scale": BENCH_SCALE, "max_l0_depth": MAX_L0_DEPTH,
             "space_ratio_max": SPACE_RATIO_MAX, "read_ratio_max": READ_RATIO_MAX,
             "files_ratio_max": FILES_RATIO_MAX, "max_file_size": MAX_FILE_SIZE,
             "rss_extra_max_kb": RSS_EXTRA_MAX_KB, "memtable_switch_ratio_min": MEMTABLE_SWITCH_RATIO_MIN,
@@ -470,7 +476,7 @@ class Verifier:
 
     def benchmark(self):
         st = self.report["stages"]["benchmark"] = {"ok": None}
-        seed, scale = self.seed, BENCH_SCALE
+        seed, scale = self.args.bench_seed or BENCH_SEED, BENCH_SCALE
         desc = self.describe(seed, scale)
         logical = desc["logical_bytes"]
         st["logical_bytes"] = logical
@@ -515,6 +521,7 @@ class Verifier:
         base, cand = results["ref"], results["cand"]
         st["baseline_wa"] = base["wa"]
         st["candidate_wa"] = cand["wa"]
+        st["wa_ratio"] = cand["wa"] / base["wa"]
         if not (BASELINE_WA_BAND[0] <= base["wa"] <= BASELINE_WA_BAND[1]):
             raise Fail("verifier self-check: pristine write amplification %.2f outside %s" % (base["wa"], BASELINE_WA_BAND))
         g = st["guardrails"] = {}
@@ -549,13 +556,10 @@ class Verifier:
             fails.append("candidate took %.0fs vs %.0fs baseline" % (cand["wall_s"], base["wall_s"]))
         g["failures"] = fails
         g["ok"] = not fails
-        st["target_reached"] = cand["wa"] <= WA_MAX
         st["ok"] = True
         if fails:
             self.log("guardrail failures: " + "; ".join(fails))
-        self.log("candidate WA %.3f (bar %.2f, baseline %.3f): %s" % (
-            cand["wa"], WA_MAX, base["wa"], "target reached" if st["target_reached"] else "target NOT reached"))
-
+        self.log("candidate WA %.3f, pristine %.3f, ratio %.4f" % (cand["wa"], base["wa"], st["wa_ratio"]))
 
     def run(self):
         self.save()
@@ -579,12 +583,11 @@ class Verifier:
         correctness = all(self.stage_ok(n) for n in ("build", "functional", "differential", "crash", "compat"))
         bench = s.get("benchmark", {})
         guard_ok = bool(bench.get("ok")) and bool(bench.get("guardrails", {}).get("ok"))
-        target = bool(bench.get("target_reached"))
         self.report["summary"] = {
             "correctness_passed": correctness,
             "guardrails_passed": guard_ok,
-            "target_reached": target,
-            "reward": 1 if (correctness and guard_ok and target) else 0,
+            "reward": 1 if (correctness and guard_ok) else 0,
+            "wa_ratio": bench.get("wa_ratio"),
             "candidate_wa": bench.get("candidate_wa"),
             "baseline_wa": bench.get("baseline_wa"),
             "elapsed_s": time.time() - self.t0,
@@ -645,7 +648,8 @@ def main():
     ap.add_argument("--out", default="/tmp/lsm-verify-report.json")
     ap.add_argument("--user", default="lsm")
     ap.add_argument("--measure", default="/opt/verifier/measure.py")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0, help="seed for the unscored stages (default: random)")
+    ap.add_argument("--bench-seed", type=int, default=0, help="override BENCH_SEED (local experiments only)")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
     v = Verifier(args)
@@ -655,7 +659,7 @@ def main():
         # bug in the driver itself; still leave a reward-0 report behind
         v.report["fatal"] = traceback.format_exc()
         v.report.setdefault("summary", {"reward": 0, "correctness_passed": False,
-                                        "guardrails_passed": False, "target_reached": False})
+                                        "guardrails_passed": False})
         v.save()
         return 1
 
