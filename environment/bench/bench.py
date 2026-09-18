@@ -3,22 +3,14 @@
 
     bench.py [--workload W ...] [--seed N] [--scale X] [--candidate-only] [--keep]
 
-Builds both engines (pristine only once) with lsmbench from this directory,
-runs every scored workload (mixed, uniform, series, blob) on each, cross-reads
-the databases and prints the guardrails and an estimated score. Defaults to
-seed 1 at scale 3, which is the verifier's scale; a full run takes a few
-minutes. --workload limits the run to some workloads while you iterate.
+Runs every workload (or the ones given) on both engines at scale 3, reads
+each database back with the other engine, and prints the guardrails and an
+estimated score.
 
-The verifier scores a fixed seed of its own. The pristine engine's numbers on
-that seed are in scored_baseline.json. A candidate's write amplification
-barely moves with the seed while the pristine's does, so candidate WA / that
-pristine WA is the estimate to trust, and every ratio guardrail is checked
-against both the local pristine run and scored_baseline.json (the worse one
-is shown). --candidate-only skips the pristine build and checks against
-scored_baseline.json alone (no RSS or time check).
-
-The score is the geometric mean of the per-workload ratios; a guardrail
-failure on any workload means the score does not count.
+The verifier uses its own seed. Pristine WA moves with the seed a lot more
+than a candidate's does, so ratios are estimated against the pristine's
+numbers on the scored seed (scored_baseline.json), and each ratio guardrail
+is checked against both that and the local pristine run.
 """
 import argparse
 import json
@@ -106,47 +98,45 @@ def run_engine(tag, binary, workload, args, logical):
 
 
 def guardrails(c, b, sb):
-    """(name, value, ok, format) per guardrail. Ratios are taken against the
-    local pristine run `b` and the scored seed's pristine `sb`, whichever is
-    worse; either may be None."""
+    """(name, value, ok, fmt) rows. b (local pristine) or sb (scored-seed
+    pristine) may be None; ratios use the worse of the two."""
     ic = c["info"]
-
-    def worst(val, local, scored, higher_is_worse=True):
-        ratios = []
-        if b is not None:
-            ratios.append(val / max(1, local(b)))
-        if sb is not None:
-            ratios.append(val / max(1, sb[scored]))
-        if not ratios:
-            return None
-        return max(ratios) if higher_is_worse else min(ratios)
-
-    out = [("level-0 depth <= %d" % MAX_L0_DEPTH, ic["max_l0_depth"], ic["max_l0_depth"] <= MAX_L0_DEPTH, "%d"),
-           ("largest table <= %d MB" % (MAX_FILE_SIZE >> 20), ic["max_file_size"] / 2**20,
-            ic["max_file_size"] <= MAX_FILE_SIZE, "%.1f MB")]
-    for name, val, limit in (
-            ("peak space <= %.2fx" % SPACE_RATIO_MAX,
-             worst(ic["max_total_bytes"], lambda r: r["info"]["max_total_bytes"], "max_total_bytes"), SPACE_RATIO_MAX),
-            ("disk after run <= %.1fx" % DISK_RATIO_MAX,
-             worst(ic["table_bytes_present"], lambda r: r["info"]["table_bytes_present"], "table_bytes_present"),
-             DISK_RATIO_MAX),
-            ("phase-F read bytes <= %.1fx" % READ_RATIO_MAX,
-             worst(c["read_f"], lambda r: r["read_f"], "read_bytes_f"), READ_RATIO_MAX),
-            ("peak file count <= %.1fx" % FILES_RATIO_MAX,
-             worst(ic["max_files"], lambda r: r["info"]["max_files"], "max_files"), FILES_RATIO_MAX)):
-        if val is not None:
-            out.append((name, val, val <= limit, "%.3fx"))
-    val = worst(ic["memtable_switches"], lambda r: r["info"]["memtable_switches"], "memtable_switches", False)
-    if val is not None:
-        out.append(("memtable switches >= %.1fx" % MEMTABLE_SWITCH_RATIO_MIN, val,
-                    val >= MEMTABLE_SWITCH_RATIO_MIN, "%.3fx"))
+    rows = [("level-0 depth <= %d" % MAX_L0_DEPTH, ic["max_l0_depth"], ic["max_l0_depth"] <= MAX_L0_DEPTH, "%d"),
+            ("largest table <= %d MB" % (MAX_FILE_SIZE >> 20), ic["max_file_size"] / 2**20,
+             ic["max_file_size"] <= MAX_FILE_SIZE, "%.1f MB")]
+    # name, candidate value, value in a local run, key in scored_baseline.json, limit
+    ratio_checks = [
+        ("peak space <= %.2fx" % SPACE_RATIO_MAX, ic["max_total_bytes"],
+         b and b["info"]["max_total_bytes"], "max_total_bytes", SPACE_RATIO_MAX),
+        ("disk after run <= %.1fx" % DISK_RATIO_MAX, ic["table_bytes_present"],
+         b and b["info"]["table_bytes_present"], "table_bytes_present", DISK_RATIO_MAX),
+        ("phase-F read bytes <= %.1fx" % READ_RATIO_MAX, c["read_f"],
+         b and b["read_f"], "read_bytes_f", READ_RATIO_MAX),
+        ("peak file count <= %.1fx" % FILES_RATIO_MAX, ic["max_files"],
+         b and b["info"]["max_files"], "max_files", FILES_RATIO_MAX),
+    ]
+    for name, val, local, key, limit in ratio_checks:
+        bases = [x for x in (local, sb and sb[key]) if x]
+        if bases:
+            ratio = val / min(bases)
+            rows.append((name, ratio, ratio <= limit, "%.3fx"))
+    # memtable switches is a floor, so the worse baseline is the larger one
+    bases = [x for x in (b and b["info"]["memtable_switches"], sb and sb["memtable_switches"]) if x]
+    if bases:
+        ratio = ic["memtable_switches"] / max(bases)
+        rows.append(("memtable switches >= %.1fx" % MEMTABLE_SWITCH_RATIO_MIN, ratio,
+                     ratio >= MEMTABLE_SWITCH_RATIO_MIN, "%.3fx"))
     if b is not None:
         extra = c["rss_kb"] - b["rss_kb"]
-        out.append(("peak RSS <= baseline + %d MB" % (RSS_EXTRA_MAX_KB >> 10), extra // 1024,
-                    extra <= RSS_EXTRA_MAX_KB, "+%d MB"))
-        out.append(("wall time <= %.0fx baseline + 60 s" % TIME_RATIO_MAX, c["wall"] / max(1.0, b["wall"]),
-                    c["wall"] <= TIME_RATIO_MAX * b["wall"] + 60, "%.2fx"))
-    return out
+        rows.append(("peak RSS <= baseline + %d MB" % (RSS_EXTRA_MAX_KB >> 10), extra // 1024,
+                     extra <= RSS_EXTRA_MAX_KB, "+%d MB"))
+        rows.append(("wall time <= %.0fx baseline + 60 s" % TIME_RATIO_MAX, c["wall"] / max(1.0, b["wall"]),
+                     c["wall"] <= TIME_RATIO_MAX * b["wall"] + 60, "%.2fx"))
+    return rows
+
+
+def geomean(values):
+    return math.exp(sum(math.log(v) for v in values) / len(values))
 
 
 def main():
@@ -204,11 +194,10 @@ def main():
             if b is not None:
                 shutil.rmtree(b["db"], ignore_errors=True)
 
-    geo = lambda d: math.exp(sum(math.log(v) for v in d.values()) / len(d))
     print("\nguardrails: %s" % ("ok" if all_ok else "FAIL (the score would not count)"))
     if estimates:
         print("estimated score: %.4f  (geometric mean over %s; untouched = 1.0, lower is better)" % (
-            geo(estimates), ", ".join(estimates)))
+            geomean(list(estimates.values())), ", ".join(estimates)))
     if len(workloads) < len(WORKLOADS):
         print("note: only %s ran; the score covers all of %s" % (", ".join(workloads), ", ".join(WORKLOADS)))
     if not full:

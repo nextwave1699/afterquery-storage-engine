@@ -16,8 +16,7 @@
 //   lsmbench selftest --db DIR
 //       small functional test of the engine API
 //
-// Every mode takes --workload NAME (mixed, uniform, series, blob; default
-// mixed, see workload.h).
+// Every mode also takes --workload (default mixed; see workload.h).
 //
 // Exit status: 0 ok, 2 a read returned the wrong result, 3 engine error,
 // 4 usage error.  All engine I/O goes through BenchEnv (bench_env.h).
@@ -108,9 +107,7 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--stop-at-end") a.stop_at_end = true;
     else if (k == "--reuse-logs") a.reuse_logs = true;
     else if (k == "--plain-tables") a.plain_tables = true;
-    else if (k == "--workload") {
-      if (!ParseWorkloadKind(need(), &a.workload)) Usage();
-    }
+    else if (k == "--workload") { if (!ParseWorkloadKind(need(), &a.workload)) Usage(); }
     else Usage();
   }
   if (a.scale <= 0 || a.scale > 8) Usage();

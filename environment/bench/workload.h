@@ -8,10 +8,9 @@
 // only has to remember one 32-bit number per id and can regenerate the value
 // expected from any read.
 //
-// There are several workloads (--workload). `mixed` is the original one and
-// the only one the crash, compatibility and differential stages use; its
-// steps and values must never change, or the sealed fixtures stop matching.
-// The others are scored alongside it and are described at WorkloadKind.
+// `mixed` is the original workload. The crash, compat and differential
+// stages only use it, and the sealed fixtures were written with it, so don't
+// change its steps or values. The other workloads are listed at WorkloadKind.
 //
 // Phases of `mixed` (sizes scale linearly with `scale`):
 //   A  load        sequential inserts of ids [0, N_A)
@@ -44,14 +43,13 @@ static const uint32_t kMaxValue = 400;
 static const uint32_t kDeletedBit = 0x80000000u;
 static const uint32_t kMaxAnyValue = 8192;  // largest value any workload writes
 
-//   mixed    phases A-E below (the original workload)
-//   uniform  load, then uniform random overwrites of every key with a few
-//            deletes and snapshots: the classic worst case for leveling
+//   mixed    phases A-E above
+//   uniform  load, then random overwrites of any key, some deletes, snapshots
 //   series   ids grow like timestamps; 12% of writes are late corrections to
-//            the most recent ids, and the oldest ids are purged in key order
-//            to keep a bounded live window (TTL-style range deletes)
-//   blob     1-6 KB values; load, then updates where 70% hit a scattered
-//            hot set of 8% of the keys
+//            recent ids, and the oldest ids get deleted in key order so only
+//            a window stays live
+//   blob     1-6 KB values; load, then updates, 70% of them to a hot set of
+//            8% of the keys spread over the whole range
 enum WorkloadKind { kMixed = 0, kUniform, kSeries, kBlob };
 
 inline bool ParseWorkloadKind(const std::string& name, WorkloadKind* k) {
@@ -63,8 +61,8 @@ inline bool ParseWorkloadKind(const std::string& name, WorkloadKind* k) {
   return true;
 }
 
-// Value lengths depend on the workload, so they are a process-wide setting
-// that the Workload constructor installs before anything is generated.
+// Value lengths depend on the workload. The Workload constructor sets this
+// before anything asks for a value.
 struct ValueProfile {
   uint32_t min_len, max_len;
 };
@@ -221,8 +219,7 @@ struct WorkloadShape {
   uint64_t universe;      // ids that may ever be written
   uint64_t read_universe; // ids that may be read (includes never-written ids)
   uint64_t f_gets, f_scans, f_scan_len, f_rscans, f_rscan_len;
-  // series only: live window kept after purging, and how far back late
-  // corrections reach
+  // series only: how many ids stay live, and how far back corrections go
   uint64_t window = 0, lag = 0;
 
   WorkloadShape(double scale, WorkloadKind kind) {
@@ -251,8 +248,8 @@ struct WorkloadShape {
   }
 
  private:
-  // n_load: keys loaded first (uniform, blob); n_updates: operations of the
-  // main phase (series: ids appended); n_hot: blob's hot set.
+  // n_load is the initial load (none for series), n_updates the main phase
+  // (for series, the number of ids appended), n_hot blob's hot set size.
   void InitOther(double scale, WorkloadKind kind) {
     auto sc = [&](double base, uint64_t min) {
       uint64_t v = static_cast<uint64_t>(base * scale + 0.5);
@@ -379,7 +376,7 @@ class Workload {
     m.kind = kStepPhase;
     m.phase = 'F';
     out->push_back(m);
-    // series reads mostly hit the live window at the end of the id space
+    // for series, mostly read the live window at the top of the id range
     const uint64_t recent = kind_ == kSeries ? shape_.window : shape_.universe;
     for (uint64_t i = 0; i < shape_.f_gets; i++) {
       Step s;
@@ -634,8 +631,8 @@ class Workload {
     return true;
   }
 
-  // uniform, series and blob: an optional load phase 'A', then the main
-  // phase 'B'; with AllowExtension, 'X' keeps going over existing ids.
+  // Everything but mixed: load ('A', skipped for series), then the main
+  // phase ('B'). With AllowExtension, 'X' continues over existing ids.
   bool NextOther(Step* st) {
     while (true) {
       switch (pos_) {
@@ -676,7 +673,7 @@ class Workload {
     return true;
   }
 
-  // A blob hot id: one of n_hot ids scattered over the whole key space.
+  // One of blob's n_hot hot ids, spread over the whole key range.
   uint64_t BlobHotId() {
     return Mix64(seed_ ^ 0xB10Bull ^ rng_.Below(shape_.n_hot)) % shape_.n_load;
   }
@@ -731,7 +728,7 @@ class Workload {
           if (!ext) sub_++;
         }
       }
-      // keep the live window bounded: purge the oldest ids in key order
+      // drop the oldest ids once the live window is full
       while (head_ - purge_next_ > shape_.window && st->ops.size() < 24) {
         AddDel(st, purge_next_++);
       }

@@ -489,11 +489,8 @@ class Verifier:
             fails += ["%s: %s" % (w, f) for f in res["guardrails"]["failures"]]
             self.save()
         ws = st["workloads"]
-        n = float(len(WORKLOADS))
-        geo = lambda key: math.exp(sum(math.log(ws[w][key]) for w in WORKLOADS) / n)
-        st["baseline_wa"] = geo("baseline_wa")
-        st["candidate_wa"] = geo("candidate_wa")
-        st["wa_ratio"] = geo("wa_ratio")
+        for key in ("baseline_wa", "candidate_wa", "wa_ratio"):
+            st[key] = geomean([ws[w][key] for w in WORKLOADS])
         st["guardrails"] = {"ok": not fails, "failures": fails}
         st["ok"] = True
         if fails:
@@ -652,6 +649,10 @@ class _Stage:
         self.v.kill_user_procs()
         self.v.save()
         return True  # swallow it; the stage is marked failed
+
+
+def geomean(values):
+    return math.exp(sum(math.log(v) for v in values) / len(values))
 
 
 def describe_failure(m):
