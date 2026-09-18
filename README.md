@@ -19,7 +19,7 @@ untouched tree scores exactly 1.0 (WA 14.10), the reference 0.350 (WA 4.93).
 
 | path | role |
 |---|---|
-| `environment/` | agent image: toolchain, `/app/leveldb` (pristine tree with vendored googletest/benchmark, git tag `pristine`), `/opt/pristine` (untouched copy), `/app/bench` (byte copies of the harness + `bench.py` + `scored_baseline.json`) |
+| `environment/` | agent image: toolchain, `/app/leveldb` (pristine tree with vendored googletest/benchmark, git tag `pristine`), `/opt/pristine` (untouched copy), `/app/bench` (byte copies of the harness + `bench.py`) |
 | `environment/sealed/leveldb.tar.gz` | the pinned source, built by `scripts/seal.sh` |
 | `tests/` | verifier image, `test.sh`, `verify.py` (driver), `test_outputs.py` (verdict), `harness/` (the harness; `environment/bench` is a copy), `sealed/` (source + fixtures) |
 | `solution/` | reference solution: `compaction.patch` + `solve.sh` |
@@ -94,37 +94,6 @@ seed; the harness drains the background queue after every operation, so the
 byte counts do not depend on timing), and both runs gave bit-identical
 write amplification.  Oracle guardrails: level-0 depth 4, peak space
 1.15x, phase-F reads 1.00x, peak files 1.65x, wall time 0.56x.
-
-## Frontier probe, first round (2026-09-17) and what changed
-
-Three Codex (gpt-6-astra) attempts, all honest (no gaming per the audit):
-
-| attempt | verifier result | agent time |
-|---|---|---|
-| 1 | gate 1, ratio 0.429 (WA 6.05) | ~23 min |
-| 2 | gate 1, ratio 0.456 (WA 6.43) | ~36 min |
-| 3 | gate 0: peak space 1.27x > 1.25x (ratio would be 0.403) | ~21 min |
-
-None came near the 200M-token floor, because every agent declared itself
-done after about half an hour.  The trajectories show two causes in the
-bundle, both fixed:
-
-* The self-check misled them.  `bench.py` showed the ratio against seed 1's
-  pristine (WA 16.49, vs 14.10 on the scored seed), so 0.35-0.37 locally was
-  really ~0.42 in the verifier and looked like the reference.  Attempt 3's
-  peak-space guardrail passed locally for the same reason (pristine peak 431
-  MB on seed 1, 419 MB on the scored seed).  `bench.py` now reads
-  `environment/bench/scored_baseline.json` (the pristine's numbers on the
-  scored seed, not the seed itself), estimates the score as candidate WA /
-  14.0985 and checks every ratio guardrail against both baselines.  For the
-  reference it prints 0.355 (verifier: 0.350) and peak space 1.16x (1.15x).
-* Nothing said how good a result was.  `instruction.md` now gives the
-  one-line easy win (~0.43, what all three attempts reached) and the
-  reference (0.35), says neither is a ceiling, and that the work is many
-  hours of iteration.
-
-The instruction also now lists the table-bytes-on-disk guardrail (<= 1.5x),
-which verify.py always enforced.
 
 ## Calibration (scale 3, seeds 1-3, level-0 depth <= 4, older contract)
 
