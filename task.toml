@@ -7,7 +7,7 @@ artifacts = [
 ]
 
 [task]
-name = "afterquery/storage-engine"
+name = "storage-engine"
 version = "1.0.0"
 description = """
 Change the compaction strategy of a pinned LevelDB (1.23) so that a fixed \
