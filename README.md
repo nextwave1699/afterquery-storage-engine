@@ -1,7 +1,7 @@
 # storage-engine
 
 Change the compaction strategy of a pinned LevelDB (1.23, commit `99b3c03b`)
-so that four fixed LSM-tree workloads are written with as few bytes as
+so that twelve fixed LSM-tree workloads are written with as few bytes as
 possible, while every read stays correct, crash recovery works at every
 engine event for both the candidate and the pristine engine, the on-disk
 format stays byte-compatible in both directions, and level-0 depth, space,
@@ -12,11 +12,10 @@ image as `/app/bench/README.md`) describes the workloads.
 Paradigm: performance, no reference solution (so no solve bar; the score is
 open-ended).  The gate (`gate_passed`, = `reward.txt`) is every correctness
 stage plus every workload's guardrails; the untouched tree passes it.  The
-objective is `write_amp_ratio` = geometric mean over the workloads `mixed`,
-`uniform`, `series` and `blob` of candidate write amplification / pristine
-write amplification, both measured in the same verifier run on a fixed
-sealed seed (`BENCH_SEED` in `tests/verify.py`).  Lower is better; the
-untouched tree scores 1.0.
+objective is `write_amp_ratio` = geometric mean over twelve workloads of
+candidate write amplification / pristine write amplification, both measured
+in the same verifier run on a fixed sealed seed (`BENCH_SEED` in
+`tests/verify.py`).  Lower is better; the untouched tree scores 1.0.
 
 Who would use a solution: anyone running LevelDB (or a fork) on flash, where
 bytes written are device wear and background I/O; the changes are the kind
@@ -49,9 +48,12 @@ snapshot read and the final full scan are checked.  `lsmbench check
 B+1, an in-flight batch) write batches, and `--continue K` extends it.
 
 `mixed` is the original workload and byte-for-byte unchanged (the sealed
-fixtures and the crash/compat/differential stages use only it); `uniform`,
-`series` and `blob` were added for the score.  Value lengths come from a
-per-workload profile (48-400 bytes, `blob` 1-6 KB).
+fixtures and the crash/compat/differential stages use only it).  The other
+eleven are recipes in one table at the top of `workload.h`: a key
+distribution (uniform, scattered hot set, rolling cursor, append with late
+corrections, bimodal, sparse) plus rates for deletes, reads, scans, batch
+size, burstiness and value lengths.  `environment/bench/README.md` has the
+table with sizes and pristine write amplification.
 
 Write amplification = `wchar` from `/proc/<pid>/io` of the run process plus
 the read-phase process, divided by the logical bytes computed by the
@@ -81,8 +83,9 @@ bytes, file count and size, memtable switches.
 5. compatibility: five sealed pristine-written fixtures (clean, live WAL,
    torn WAL, `reuse_logs`, filterless 16 KB-block tables) and one generated
    at verify time; candidate reads and extends, pristine reads;
-6. every workload at scale 3 and `BENCH_SEED` with both engines, cross reads
-   at full scale, guardrails per workload, and the score.
+6. all twelve workloads at scale 3 and `BENCH_SEED` with both engines, cross
+   reads at full scale, guardrails per workload, and the score.  493 s for
+   the untouched tree locally; `verifier_runtime_sec` is declared at 2700.
 
 `reward.txt` and `gate_passed` are 1 when every stage and every guardrail
 hold.  `write_amp_ratio` and the informational `write_amp_ratio_<workload>`
@@ -92,44 +95,67 @@ random seeds only drive the unscored correctness stages.
 
 ## Measurements on the scored seed (scale 3)
 
-Pristine, and three candidates, measured with the harness in the agent image
-(Ubuntu 24.04, g++ 13.3, CMake Release):
+Pristine and two sample engines, measured with the harness in the agent
+image (Ubuntu 24.04, g++ 13.3, CMake Release).  "Seek off" is
+`scripts/old_reference.patch` without its other changes: the one-line
+strategy that used to win.  "Sample" is `scripts/sample_candidate.patch`.
 
-| workload | pristine WA | seek compactions off | old reference | sample candidate |
-|---|---|---|---|---|
-| `mixed` | 14.10 | 0.430 | 0.350 | 0.773 |
-| `uniform` | 10.44 | 0.594 | 0.528 | 0.819 |
-| `series` | 4.33 | 0.969, **reads 24x, time 6.2x** | 0.876, **reads 24x, time 6.2x** | 0.983 |
-| `blob` | 5.00 | 0.863 | 0.735 | 0.850 |
-| score | 1.0 | gate fails | gate fails | 0.853 |
+| workload | pristine WA | seek off | sample |
+|---|---|---|---|
+| `mixed` | 14.10 | 0.430 | 0.773 |
+| `uniform` | 10.44 | 0.594 | 0.819 |
+| `hotkey` | 3.54 | 0.893 | 0.916 |
+| `rolling` | 7.23 | 0.688 | 0.712 |
+| `bursts` | 15.43 | 0.392 | 0.538 |
+| `smallval` | 9.72 | 0.576 | 0.803 |
+| `blob` | 5.13 | 0.861 | 0.845 |
+| `wide` | 9.55 | 0.772 | 0.855 |
+| `scan` | 8.00 | 0.626 | 0.869 |
+| `bimodal` | 5.08 | 0.833 | 0.821 |
+| `series` | 4.33 | **fails** (reads 24x) | 0.983 |
+| `ttl` | 3.74 | **fails** (reads 26x) | 1.042 |
+| **score** | **1.0** | **0.690, but gate fails** | **0.8213** |
 
-* The untouched tree's ratio is 1.0 by construction (same source, same
-  seed).  Two `harbor run -a nop` runs gave 1.0 and 1.00002.  `mixed`,
-  `uniform` and `blob` are bit-identical run to run; `series` can differ by
-  ~1e-4, because a long scan can trigger a read-sampled compaction that the
-  worker thread runs while the scan is still going.  The declared tolerance
-  is 0.01.
-* Verifier runtime for the untouched tree: 233 s locally (declared 2700).
-* `scripts/docker_failure_paths.sh`, 18 cases: nop 1 (1.0000), sample 1
-  (0.8525); old-reference, seek-only (series reads 24x, time ~10x),
-  tiered-constants (level-0 depth 12 everywhere), no-compaction, no-wal,
-  format-change, big-memtable, wrong-get, scan-bug, crash-in-compaction,
-  hang, planted-reward, verifier-exception, nobuild, missing, header-break
-  all 0 with both reward files present.
-* "Seek compactions off" is the one-line change that used to be the easy
-  win.  On `series`, whose phase-F scans start inside the purged key range,
-  the tombstones then stay put and phase-F reads grow 24x (limit 1.5x) and
-  wall time 6.2x (limit 4x + 60 s).
-* "Old reference" is the previous single-workload reference
-  (`scripts/old_reference.patch`: seek compactions off, cheapest cold file
-  first, grandparent-aligned outputs).  It fails the same way.
-* "Sample candidate" (`scripts/sample_candidate.patch`) is the old
-  reference's policy changes with seek compactions left on.  It passes
-  every guardrail on every workload.
-* Headroom: agents have taken `mixed` alone to 0.28 (see below), so a
-  policy that gets most of that on `mixed` and `uniform` while keeping
-  `series` scans cheap leaves plenty of room below 0.85.  No lower bound is
-  known, and no reference is shipped.
+* The untouched tree scores 1.0 by construction and the full verifier
+  measured exactly 1.0000 (493 s locally).
+* Seek-triggered compactions off is the strategy every earlier agent found.
+  It is worth 0.43 on `mixed` and 0.39 on `bursts`, but on `series` and
+  `ttl` the ranges purged in key order are never compacted away, so phase-F
+  scans read 24x and 26x the baseline and the gate fails.  Even if it
+  passed, spread over twelve workloads it averages 0.690, because the
+  workloads with little headroom (`hotkey` 3.5 pristine WA, `ttl` 3.7,
+  `series` 4.3, `blob` 5.1) pull it back towards 1.0.
+* The sample engine keeps seek compactions and adds min-overlap-per-byte
+  input selection with a hotness weight plus grandparent-aligned outputs.
+  It passes every guardrail on all twelve and scores 0.8213.
+* `ttl`'s phase-F read guardrail is 2.5x rather than 1.5x: only a tenth of
+  its ids stay live, so scans cross long tombstone runs and read cost
+  swings much harder there.  The sample engine measures 1.7x; the
+  pile-up case is 26x, so the limit still catches it.
+* Headroom: agents took `mixed` alone to 0.28 (see below), and no workload
+  here is near that, so there is a lot of room below the sample's 0.82.  No
+  lower bound is known and no reference is shipped.
+
+### The flush side: measured, not assumed
+
+`bimodal` was built on the idea that a memtable holding both tail appends
+and low-key updates flushes to one level-0 file overlapping everything
+beneath it, so splitting flush output should pay.  Two prototypes on top of
+the sample engine (`WriteLevel0Table` in `db/db_impl.cc` writing several
+tables per memtable) say otherwise:
+
+| variant | `bimodal` | `mixed` | `rolling` | `series` | `ttl` |
+|---|---|---|---|---|---|
+| sample | 0.821 | 0.773 | 0.712 | 0.983 | 1.042 |
+| split by size (2 MB) | 1.145 | 0.810 | 0.840 | 1.328 | 1.136 |
+| split at level-1 boundaries | 1.143 | 0.815 | 0.875 | 1.172 | 1.226 |
+
+Both are worse everywhere: at a 4 MB write buffer the extra level-0 files
+cost more than the reduced overlap saves.  So the task does not *force* a
+candidate through the flush path, and neither the instruction nor this
+README claims it does.  What the corpus does is make single-lever policies
+plateau.  The prototypes are not in the bundle; they are recorded here so a
+reviewer knows the avenue was measured rather than assumed.
 
 ## History: why the task looks like this
 
@@ -145,10 +171,31 @@ The first version scored `mixed` alone, with a shipped reference at 0.35.
   tuning for one workload is a short problem with an easy path, and the
   reference was weak.
 
-Hence: four workloads that pull the policy in different directions under
-the same guardrails, the self-check comparing against the scored seed's
+Hence: workloads that pull the policy in different directions under the
+same guardrails, the self-check comparing against the scored seed's
 baseline (`scored_baseline.json`, which does not reveal the seed), and no
 reference, so the objective is open-ended.
+
+With four workloads (2026-09-18): the easiness screen passed (medium, one
+attempt, 0.555 in 34 minutes, no solve bar).  The frontier probe's three
+xhigh attempts all passed the gate with different policies, at 0.565, 0.610
+and 0.616 (mixed 0.38-0.41, uniform 0.54-0.59, series 0.65-0.90, blob
+0.73-0.81), and their `bench.py` estimates matched the verifier within
+about 1%.  Each agent reported completion after about 48 minutes, with
+11-18M tokens, so the token floor failed again: the search space was a
+dozen labelled compaction knobs in one file and the measure loop was
+seconds long, so a competent agent converged in under an hour.
+
+With twelve workloads (2026-09-20): the corpus now spans skewed overwrites,
+sequential sweeps, bursts, tiny and large values, sparse writes,
+scan-heavy reads, interleaved appends/updates and TTL purges, all under the
+same guardrails.  A policy that only picks compaction inputs better cannot
+carry all of them: the strategy those three agents converged on averages
+about 0.7 here and the seek-off lever fails the gate outright.  Whether
+anything much below the sample's 0.82 is reachable without new machinery is
+open; the flush-side prototypes above did not get there.  The instruction
+also says outright that there is no finish line and that results are
+ranked.
 
 ## Calibration of `mixed` alone (scale 3, seeds 1-3, older contract)
 

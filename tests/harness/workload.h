@@ -43,22 +43,76 @@ static const uint32_t kMaxValue = 400;
 static const uint32_t kDeletedBit = 0x80000000u;
 static const uint32_t kMaxAnyValue = 8192;  // largest value any workload writes
 
-//   mixed    phases A-E above
-//   uniform  load, then random overwrites of any key, some deletes, snapshots
-//   series   ids grow like timestamps; 12% of writes are late corrections to
-//            recent ids, and the oldest ids get deleted in key order so only
-//            a window stays live
-//   blob     1-6 KB values; load, then updates, 70% of them to a hot set of
-//            8% of the keys spread over the whole range
-enum WorkloadKind { kMixed = 0, kUniform, kSeries, kBlob };
+// `mixed` is the hand-written workload above.  The rest are recipes: a key
+// distribution plus rates for deletes, reads and batching.  They exist to
+// pull compaction policy in different directions -- what helps a workload
+// that overwrites a small hot set hurts one that appends and purges, and a
+// flush that spans the whole key range costs more in some than in others.
+enum WorkloadKind {
+  kMixed = 0, kUniform, kSeries, kBlob, kHotkey, kBursts,
+  kTtl, kScan, kBimodal, kRolling, kSmallval, kWide, kNumWorkloads
+};
+
+// Where the next written key comes from.
+enum KeyDist {
+  kDistUniform,   // any loaded key, uniformly
+  kDistHot,       // hot_pct% of writes into a hot set scattered over the keys
+  kDistRolling,   // a cursor sweeping the key space in order, over and over
+  kDistAppend,    // ids grow like timestamps, with late corrections
+  kDistBimodal,   // half appends at the tail, half updates in a low hot range
+  kDistSparse,    // random ids over a key space much larger than the load
+};
+
+struct Recipe {
+  const char* name;
+  KeyDist dist;
+  uint64_t load;       // keys written before the main phase
+  uint64_t ops;        // writes in the main phase (appends, for kDistAppend)
+  uint32_t hot_share;  // hot set, in % of the loaded keys
+  uint32_t hot_pct;    // % of writes aimed at the hot set
+  uint32_t del_pct;    // % of writes that are deletes
+  uint32_t get_pct;    // % of steps that are a point read
+  uint32_t scan_pct;   // % of steps that are a range scan
+  uint32_t scan_lo, scan_hi;
+  uint32_t batch_max;  // writes per batch, 1..batch_max
+  uint32_t burst;      // >0: this many write batches, then a lull of reads
+  uint64_t window;     // kDistAppend: ids kept live (0: keep everything)
+  uint64_t lag;        // kDistAppend: how far back a correction reaches
+  uint32_t corr_pct;   // kDistAppend: % of writes that are corrections
+  bool snapshots;
+  uint32_t vmin, vmax;  // value lengths
+};
+
+// Indexed by WorkloadKind; the first entry is a placeholder for `mixed`.
+inline const Recipe* Recipes() {
+  static const Recipe r[kNumWorkloads] = {
+    // name       dist           load     ops    hotsh hot del get scn scan_lo/hi bat burst window  lag   corr snap vmin vmax
+    {"mixed",     kDistUniform,       0,       0,  0,   0,  0,  0,  0,    0,    0,  0,   0,      0,     0,  0, false,   48,  400},
+    {"uniform",   kDistUniform,  200000,  600000,  0,   0,  5,  8,  1,   50,  200,  8,   0,      0,     0,  0, true,    48,  400},
+    {"series",    kDistAppend,        0,  700000,  0,   0,  0, 10,  1,  100,  500,  8,   0, 180000, 20000, 12, false,   48,  400},
+    {"blob",      kDistHot,       30000,   30000,  8,  70,  5, 10,  1,    8,   32,  2,   0,      0,     0,  0, false, 1024, 6144},
+    {"hotkey",    kDistHot,      200000,  600000,  1,  90,  3,  8,  1,   50,  200,  8,   0,      0,     0,  0, true,    48,  400},
+    {"bursts",    kDistUniform,  200000,  500000,  0,   0,  5,  2,  1,   50,  200, 12, 200,      0,     0,  0, false,   48,  400},
+    {"ttl",       kDistAppend,        0,  600000,  0,   0,  0,  8,  2,  200,  800,  8,   0,  60000,  8000,  8, false,   48,  400},
+    {"scan",      kDistUniform,  300000,  300000,  0,   0,  4,  5, 15,  500, 2000,  8,   0,      0,     0,  0, false,   48,  400},
+    {"bimodal",   kDistBimodal,  150000,  600000,  5,  50,  3,  6,  1,   50,  200,  8,   0,      0,     0,  0, false,   48,  400},
+    {"rolling",   kDistRolling,  300000,  600000,  0,   0,  2,  6,  1,   50,  200,  8,   0,      0,     0,  0, false,   48,  400},
+    {"smallval",  kDistUniform,  600000, 1200000,  0,   0,  5,  6,  1,   50,  200, 16,   0,      0,     0,  0, false,   16,   48},
+    {"wide",      kDistSparse,    50000,  400000,  0,   0,  2,  6,  1,   50,  200,  8,   0,      0,     0,  0, false,   48,  400},
+  };
+  return r;
+}
+
+inline const Recipe& RecipeOf(WorkloadKind k) { return Recipes()[k]; }
 
 inline bool ParseWorkloadKind(const std::string& name, WorkloadKind* k) {
-  if (name == "mixed") *k = kMixed;
-  else if (name == "uniform") *k = kUniform;
-  else if (name == "series") *k = kSeries;
-  else if (name == "blob") *k = kBlob;
-  else return false;
-  return true;
+  for (int i = 0; i < kNumWorkloads; i++) {
+    if (name == Recipes()[i].name) {
+      *k = static_cast<WorkloadKind>(i);
+      return true;
+    }
+  }
+  return false;
 }
 
 // Value lengths depend on the workload. The Workload constructor sets this
@@ -248,37 +302,35 @@ struct WorkloadShape {
   }
 
  private:
-  // n_load is the initial load (none for series), n_updates the main phase
-  // (for series, the number of ids appended), n_hot blob's hot set size.
+  // Everything but `mixed` comes from its Recipe.  n_load is the initial
+  // load, n_updates the main phase, n_hot the hot set.
   void InitOther(double scale, WorkloadKind kind) {
+    const Recipe& r = RecipeOf(kind);
     auto sc = [&](double base, uint64_t min) {
       uint64_t v = static_cast<uint64_t>(base * scale + 0.5);
       return v < min ? min : v;
     };
     n_insert = n_deletes = n_mixed = n_mixed_new = 0;
-    n_hot = 0;
-    if (kind == kUniform) {
-      n_load = sc(200000, 200);
-      n_updates = sc(600000, 400);
-      universe = n_load;
-    } else if (kind == kSeries) {
-      n_load = 0;
-      n_updates = sc(700000, 800);
+    n_load = r.load == 0 ? 0 : sc(r.load, 100);
+    n_updates = sc(r.ops, 400);
+    n_hot = r.hot_share == 0 ? 0 : n_load * r.hot_share / 100 + 1;
+    window = r.window == 0 ? 0 : sc(r.window, 200);
+    lag = r.lag == 0 ? 0 : sc(r.lag, 50);
+    if (r.dist == kDistAppend) {
       universe = n_updates;
-      window = sc(180000, 200);
-      lag = sc(20000, 50);
+    } else if (r.dist == kDistBimodal) {
+      universe = n_load + n_updates;
+    } else if (r.dist == kDistSparse) {
+      universe = (n_load + n_updates) * 4;
     } else {
-      n_load = sc(30000, 100);
-      n_updates = sc(30000, 100);
-      n_hot = n_load * 8 / 100 + 1;
       universe = n_load;
     }
     read_universe = universe + universe / 16 + 64;
     f_gets = sc(20000, 200);
     f_scans = sc(200, 8);
-    f_scan_len = kind == kBlob ? 50 : 500;
+    f_scan_len = r.scan_hi;
     f_rscans = sc(20, 4);
-    f_rscan_len = kind == kBlob ? 20 : 200;
+    f_rscan_len = r.scan_hi / 2 + 1;
   }
 };
 
@@ -287,8 +339,8 @@ class Workload {
  public:
   Workload(uint64_t seed, double scale, WorkloadKind kind = kMixed)
       : seed_(seed), kind_(kind), shape_(scale, kind), rng_(seed ^ 0x77ull), batches_(0) {
-    ValueProfile& vp = CurrentValueProfile();
-    vp = kind == kBlob ? ValueProfile{1024, 6144} : ValueProfile{kMinValue, kMaxValue};
+    const Recipe& r = RecipeOf(kind);
+    CurrentValueProfile() = ValueProfile{r.vmin, r.vmax};
     Rng hr(seed ^ 0x407ull);
     // Phase C's hot range: n_hot consecutive ids somewhere in the loaded space.
     hot_lo_ = hr.Below(shape_.n_load + shape_.n_insert - shape_.n_hot);
@@ -376,13 +428,14 @@ class Workload {
     m.kind = kStepPhase;
     m.phase = 'F';
     out->push_back(m);
-    // for series, mostly read the live window at the top of the id range
-    const uint64_t recent = kind_ == kSeries ? shape_.window : shape_.universe;
+    // appending workloads mostly read the live window at the top
+    const bool appending = recipe().dist == kDistAppend;
+    const uint64_t recent = appending && shape_.window ? shape_.window : shape_.universe;
     for (uint64_t i = 0; i < shape_.f_gets; i++) {
       Step s;
       s.kind = kStepGet;
       s.phase = 'F';
-      if (kind_ == kSeries && r.Chance(85)) {
+      if (appending && r.Chance(85)) {
         s.id = shape_.universe - 1 - r.Below(recent);
       } else {
         s.id = r.Chance(85) ? r.Below(shape_.universe) : r.Below(shape_.read_universe);
@@ -645,6 +698,7 @@ class Workload {
           return OtherLoadStep(st);
         case 2:
           pos_ = 3; sub_ = 0;
+          head_ = shape_.n_load;
           return Marker(st, 'B');
         case 3:
           if (sub_ >= shape_.n_updates) {
@@ -665,26 +719,65 @@ class Workload {
 
   bool OtherLoadStep(Step* st) {
     Batch(st, 'A');
-    int per = kind_ == kBlob ? 2 : 8;
-    for (int i = 0; i < per && sub_ < shape_.n_load; i++) {
+    const Recipe& r = recipe();
+    uint32_t per = r.vmax > 1024 ? 2 : 8;
+    for (uint32_t i = 0; i < per && sub_ < shape_.n_load; i++) {
       AddPut(st, sub_);
       sub_++;
     }
     return true;
   }
 
-  // One of blob's n_hot hot ids, spread over the whole key range.
-  uint64_t BlobHotId() {
+  const Recipe& recipe() const { return RecipeOf(kind_); }
+
+  // One of the n_hot ids of a scattered hot set.
+  uint64_t ScatterHotId() {
     return Mix64(seed_ ^ 0xB10Bull ^ rng_.Below(shape_.n_hot)) % shape_.n_load;
   }
-  uint64_t SeriesRecentId() {
+  // The newest ids of an appending workload, i.e. what is still live.
+  uint64_t RecentId() {
     uint64_t live = head_ - purge_next_;
     return head_ - 1 - rng_.Below(live == 0 ? 1 : live);
   }
 
+  // The key of the next write, for everything but kDistAppend/kDistBimodal,
+  // which need the step itself.
+  uint64_t WriteId() {
+    const Recipe& r = recipe();
+    switch (r.dist) {
+      case kDistHot:
+        return rng_.Chance(r.hot_pct) ? ScatterHotId() : rng_.Below(shape_.n_load);
+      case kDistRolling:
+        return cursor_++ % shape_.n_load;
+      case kDistSparse:
+        return rng_.Below(shape_.universe);
+      default:
+        return rng_.Below(shape_.n_load == 0 ? 1 : shape_.n_load);
+    }
+  }
+
+  // An id to remember in a snapshot: always one that exists in the model.
+  uint64_t SnapSampleId() {
+    const Recipe& r = recipe();
+    if (r.dist == kDistAppend && head_ > purge_next_) return RecentId();
+    if (r.dist == kDistHot && rng_.Chance(50)) return ScatterHotId();
+    return ExistingId();
+  }
+
+  uint64_t OtherReadId() {
+    const Recipe& r = recipe();
+    if (r.dist == kDistAppend && head_ > purge_next_) {
+      return rng_.Chance(90) ? RecentId() : rng_.Below(shape_.read_universe);
+    }
+    if (r.dist == kDistHot && rng_.Chance(50)) return ScatterHotId();
+    return ReadId();
+  }
+
+  // One step of the main phase.  `phase` is 'B', or 'X' past the end.
   bool OtherMainStep(Step* st, char phase) {
+    const Recipe& r = recipe();
     const bool ext = phase == 'X';
-    if (kind_ == kUniform && !ext) {
+    if (r.snapshots && !ext) {
       if (snap_pending_ && main_batches_ >= snap_check_at_) {
         snap_pending_ = false;
         return SnapCheck(st, phase);
@@ -695,63 +788,82 @@ class Workload {
         snap_check_at_ = main_batches_ + 1500;
         st->kind = kStepSnapTake;
         st->phase = phase;
-        for (int i = 0; i < 64; i++) st->ids.push_back(ExistingId());
+        for (int i = 0; i < 64; i++) st->ids.push_back(SnapSampleId());
         return true;
       }
     }
-    uint64_t roll = rng_.Below(100);
-    if (kind_ == kSeries) {
-      if (head_ > purge_next_ && roll < 10) {
+    // Bursty workloads write flat out, then stop writing and only read.
+    if (r.burst > 0) {
+      if (lull_left_ > 0) {
+        lull_left_--;
         st->kind = kStepGet;
         st->phase = phase;
-        st->id = rng_.Chance(90) ? SeriesRecentId() : rng_.Below(shape_.read_universe);
+        st->id = OtherReadId();
         return true;
       }
-      if (head_ > purge_next_ && roll < 11) {
+      if (burst_left_ == 0) {
+        burst_left_ = r.burst;
+        lull_left_ = r.burst / 4 + 1;
+      }
+      burst_left_--;
+    } else {
+      uint64_t roll = rng_.Below(100);
+      if (roll < r.get_pct) {
+        st->kind = kStepGet;
+        st->phase = phase;
+        st->id = OtherReadId();
+        return true;
+      }
+      if (roll < r.get_pct + r.scan_pct) {
         st->kind = kStepScan;
         st->phase = phase;
-        st->id = SeriesRecentId();
-        st->count = 100 + static_cast<uint32_t>(rng_.Below(401));
+        st->id = r.dist == kDistAppend && head_ > purge_next_ ? RecentId()
+                                                              : rng_.Below(shape_.read_universe);
+        st->count = r.scan_lo + static_cast<uint32_t>(rng_.Below(r.scan_hi - r.scan_lo + 1));
         return true;
       }
-      Batch(st, phase);
-      main_batches_++;
-      for (int i = 0; i < 8; i++) {
-        bool late = head_ > 0 && (ext || head_ >= shape_.universe || rng_.Chance(12));
-        if (late) {
-          uint64_t back = head_ - purge_next_;
-          if (back > shape_.lag) back = shape_.lag;
-          if (back == 0) continue;
-          AddPut(st, head_ - 1 - rng_.Below(back));
-        } else {
-          AddPut(st, head_++);
-          if (!ext) sub_++;
-        }
-      }
-      // drop the oldest ids once the live window is full
-      while (head_ - purge_next_ > shape_.window && st->ops.size() < 24) {
-        AddDel(st, purge_next_++);
-      }
-      return true;
-    }
-    uint32_t get_pct = kind_ == kBlob ? 10 : 8;
-    if (roll < get_pct) return Get(st, phase);
-    if (roll < get_pct + 1) {
-      return kind_ == kBlob ? Scan(st, phase, 8, 32) : Scan(st, phase, 50, 200);
     }
     Batch(st, phase);
     main_batches_++;
-    int n = kind_ == kBlob ? 1 + static_cast<int>(rng_.Below(2)) : 1 + static_cast<int>(rng_.Below(8));
-    for (int i = 0; i < n && (ext || sub_ < shape_.n_updates); i++) {
-      uint64_t r = rng_.Below(100);
-      if (r < 5) {
+    if (r.dist == kDistAppend) return AppendBatch(st, ext);
+    uint32_t n = 1 + static_cast<uint32_t>(rng_.Below(r.batch_max));
+    for (uint32_t i = 0; i < n && (ext || sub_ < shape_.n_updates); i++) {
+      if (rng_.Chance(r.del_pct)) {
         AddDel(st, ExistingId());
-      } else if (kind_ == kBlob && r < 75) {
-        AddPut(st, BlobHotId());
+      } else if (r.dist == kDistBimodal) {
+        // half the writes extend the tail, half update a range low in the
+        // key space: one flushed memtable then spans nearly everything
+        if (rng_.Chance(r.hot_pct) || head_ >= shape_.universe) {
+          AddPut(st, hot_lo_ + rng_.Below(shape_.n_hot));
+        } else {
+          AddPut(st, head_++);
+        }
       } else {
-        AddPut(st, ExistingId());
+        AddPut(st, WriteId());
       }
       if (!ext) sub_++;
+    }
+    return true;
+  }
+
+  // kDistAppend: ids grow like timestamps, some writes correct a recent id,
+  // and the oldest ids are deleted in key order to keep the window bounded.
+  bool AppendBatch(Step* st, bool ext) {
+    const Recipe& r = recipe();
+    for (uint32_t i = 0; i < r.batch_max; i++) {
+      bool late = head_ > 0 && (ext || head_ >= shape_.universe || rng_.Chance(r.corr_pct));
+      if (late) {
+        uint64_t back = head_ - purge_next_;
+        if (back > shape_.lag) back = shape_.lag;
+        if (back == 0) continue;
+        AddPut(st, head_ - 1 - rng_.Below(back));
+      } else {
+        AddPut(st, head_++);
+        if (!ext) sub_++;
+      }
+    }
+    while (shape_.window > 0 && head_ - purge_next_ > shape_.window && st->ops.size() < 24) {
+      AddDel(st, purge_next_++);
     }
     return true;
   }
@@ -769,7 +881,9 @@ class Workload {
   int pos_;
   uint64_t sub_;
   uint64_t mixed_new_next_ = 0;
-  uint64_t head_ = 0, purge_next_ = 0, main_batches_ = 0;  // uniform/series/blob
+  // state of the recipe workloads
+  uint64_t head_ = 0, purge_next_ = 0, main_batches_ = 0, cursor_ = 0;
+  uint32_t burst_left_ = 0, lull_left_ = 0;
   uint64_t insert_batches_ = 0, update_batches_ = 0, delete_batches_ = 0, mixed_batches_ = 0;
   bool did_read_ = false;
   int pending_read_ = 0;

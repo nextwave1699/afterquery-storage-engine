@@ -40,6 +40,14 @@ write_zero() {
   "write_amp_ratio_uniform": 1.0,
   "write_amp_ratio_series": 1.0,
   "write_amp_ratio_blob": 1.0,
+  "write_amp_ratio_hotkey": 1.0,
+  "write_amp_ratio_bursts": 1.0,
+  "write_amp_ratio_ttl": 1.0,
+  "write_amp_ratio_scan": 1.0,
+  "write_amp_ratio_bimodal": 1.0,
+  "write_amp_ratio_rolling": 1.0,
+  "write_amp_ratio_smallval": 1.0,
+  "write_amp_ratio_wide": 1.0,
   "write_amp": 0.0,
   "baseline_write_amp": 0.0,
   "wa_reduction": 0.0
@@ -92,7 +100,7 @@ out = {
     "wa_reduction": (1.0 - wa / base) if (wa > 0 and base > 0) else 0.0,
 }
 # per-workload ratios, same rule: 1.0 unless the gate passed
-for w in ("mixed", "uniform", "series", "blob"):
+for w in ("mixed", "uniform", "series", "blob", "hotkey", "bursts", "ttl", "scan", "bimodal", "rolling", "smallval", "wide"):
     wr = num(bench.get("workloads", {}).get(w, {}).get("wa_ratio"), 1.0)
     out["write_amp_ratio_" + w] = wr if reward else 1.0
 tmp = out_path + ".tmp"

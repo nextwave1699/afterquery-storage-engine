@@ -474,7 +474,9 @@ class Runner {
     if (snapshot_ != nullptr) db_->ReleaseSnapshot(snapshot_);
     snapshot_ = db_->GetSnapshot();
     snap_sample_.clear();
-    for (uint64_t id : st.ids) snap_sample_.emplace_back(id, model_.ver[id]);
+    for (uint64_t id : st.ids) {
+      if (id < model_.ver.size()) snap_sample_.emplace_back(id, model_.ver[id]);
+    }
   }
 
   void DoSnapCheck() {

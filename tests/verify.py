@@ -47,8 +47,12 @@ import manifest  # noqa: E402
 BENCH_SEED = 604729
 # Scored workloads and the pristine WA each should land in; outside the band
 # something is off with the box.
-WORKLOADS = ["mixed", "uniform", "series", "blob"]
-BASELINE_WA_BAND = {"mixed": (11.0, 22.0), "uniform": (7.0, 16.0), "series": (3.0, 7.0), "blob": (3.5, 8.0)}
+WORKLOADS = ["mixed", "uniform", "series", "blob", "hotkey", "bursts",
+             "ttl", "scan", "bimodal", "rolling", "smallval", "wide"]
+BASELINE_WA_BAND = {
+    "mixed": (9.9, 19.7), "uniform": (7.3, 14.6), "series": (3.0, 6.1), "blob": (3.6, 7.2),
+    "hotkey": (2.5, 5.0), "bursts": (10.8, 21.6), "ttl": (2.6, 5.2), "scan": (5.6, 11.2),
+    "bimodal": (3.6, 7.1), "rolling": (5.1, 10.1), "smallval": (6.8, 13.6), "wide": (6.7, 13.4)}
 BENCH_SCALE = 3.0
 SMALL_SCALE = 0.25
 CRASH_SCALE = 0.3
@@ -56,6 +60,9 @@ FIXTURE_SCALE = 0.15
 MAX_L0_DEPTH = 4               # level-0 files overlapping one key, at any version
 SPACE_RATIO_MAX = 1.25         # peak table bytes vs. pristine
 READ_RATIO_MAX = 1.5           # phase-F bytes read vs. pristine
+# ttl keeps only a tenth of its ids live, so phase-F scans cross long runs of
+# tombstones and read cost swings much harder there than elsewhere.
+READ_RATIO_MAX_BY_WORKLOAD = {"ttl": 2.5}
 FILES_RATIO_MAX = 3.0          # peak file count vs. pristine
 MAX_FILE_SIZE = 8 * 1024 * 1024
 RSS_EXTRA_MAX_KB = 96 * 1024   # peak RSS vs. pristine
@@ -83,7 +90,8 @@ class Verifier:
         self.work = args.work
         self.user = args.user or None
         self.report = {"stages": {}, "log": [], "contract": {
-            "bench_seed": BENCH_SEED, "bench_scale": BENCH_SCALE, "workloads": WORKLOADS, "max_l0_depth": MAX_L0_DEPTH,
+            "bench_seed": BENCH_SEED, "bench_scale": BENCH_SCALE, "workloads": WORKLOADS,
+            "read_ratio_max_by_workload": READ_RATIO_MAX_BY_WORKLOAD, "max_l0_depth": MAX_L0_DEPTH,
             "space_ratio_max": SPACE_RATIO_MAX, "read_ratio_max": READ_RATIO_MAX,
             "files_ratio_max": FILES_RATIO_MAX, "max_file_size": MAX_FILE_SIZE,
             "rss_extra_max_kb": RSS_EXTRA_MAX_KB, "memtable_switch_ratio_min": MEMTABLE_SWITCH_RATIO_MIN,
@@ -570,8 +578,9 @@ class Verifier:
             fails.append("level-0 depth %d > %d" % (g["max_l0_depth"], MAX_L0_DEPTH))
         if g["space_ratio"] > SPACE_RATIO_MAX:
             fails.append("peak space %.2fx baseline > %.2f" % (g["space_ratio"], SPACE_RATIO_MAX))
-        if g["read_ratio"] > READ_RATIO_MAX:
-            fails.append("phase-F read bytes %.2fx baseline > %.2f" % (g["read_ratio"], READ_RATIO_MAX))
+        read_max = READ_RATIO_MAX_BY_WORKLOAD.get(w, READ_RATIO_MAX)
+        if g["read_ratio"] > read_max:
+            fails.append("phase-F read bytes %.2fx baseline > %.2f" % (g["read_ratio"], read_max))
         if g["files_ratio"] > FILES_RATIO_MAX:
             fails.append("peak file count %.2fx baseline > %.2f" % (g["files_ratio"], FILES_RATIO_MAX))
         if g["max_file_size"] > MAX_FILE_SIZE:

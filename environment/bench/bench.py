@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Measure /app/leveldb against /opt/pristine the way the verifier does.
 
-    bench.py [--workload W ...] [--seed N] [--scale X] [--candidate-only] [--keep]
+    bench.py [--quick] [--workload W ...] [--seed N] [--scale X]
+             [--candidate-only] [--keep]
 
 Runs every workload (or the ones given) on both engines at scale 3, reads
 each database back with the other engine, and prints the guardrails and an
-estimated score.
+estimated score. That is the same measurement the verifier makes, and it
+takes a while: budget ~15 minutes.
+
+--quick is the fast loop: four workloads at scale 1 (~2 min), chosen to
+cover the different pressures (mixed, bursts, ttl, bimodal). It moves in the
+same direction as the score but is not the score: fewer workloads, and a
+smaller scale builds fewer levels, so the numbers are higher than at scale 3.
+Use it to reject ideas, then confirm with a full run.
 
 The verifier uses its own seed. Pristine WA moves with the seed a lot more
 than a candidate's does, so ratios are estimated against the pristine's
@@ -24,11 +32,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import manifest  # noqa: E402
 
-WORKLOADS = ["mixed", "uniform", "series", "blob"]
+WORKLOADS = ["mixed", "uniform", "series", "blob", "hotkey", "bursts",
+             "ttl", "scan", "bimodal", "rolling", "smallval", "wide"]
+QUICK_WORKLOADS = ["mixed", "bursts", "ttl", "bimodal"]
 MAX_L0_DEPTH = 4
 SPACE_RATIO_MAX = 1.25
 DISK_RATIO_MAX = 1.5
 READ_RATIO_MAX = 1.5
+READ_RATIO_MAX_BY_WORKLOAD = {"ttl": 2.5}   # long tombstone runs, see the README
 FILES_RATIO_MAX = 3.0
 MAX_FILE_SIZE = 8 * 1024 * 1024
 RSS_EXTRA_MAX_KB = 96 * 1024
@@ -97,10 +108,11 @@ def run_engine(tag, binary, workload, args, logical):
     return res
 
 
-def guardrails(c, b, sb):
+def guardrails(c, b, sb, workload):
     """(name, value, ok, fmt) rows. b (local pristine) or sb (scored-seed
     pristine) may be None; ratios use the worse of the two."""
     ic = c["info"]
+    read_max = READ_RATIO_MAX_BY_WORKLOAD.get(workload, READ_RATIO_MAX)
     rows = [("level-0 depth <= %d" % MAX_L0_DEPTH, ic["max_l0_depth"], ic["max_l0_depth"] <= MAX_L0_DEPTH, "%d"),
             ("largest table <= %d MB" % (MAX_FILE_SIZE >> 20), ic["max_file_size"] / 2**20,
              ic["max_file_size"] <= MAX_FILE_SIZE, "%.1f MB")]
@@ -110,8 +122,8 @@ def guardrails(c, b, sb):
          b and b["info"]["max_total_bytes"], "max_total_bytes", SPACE_RATIO_MAX),
         ("disk after run <= %.1fx" % DISK_RATIO_MAX, ic["table_bytes_present"],
          b and b["info"]["table_bytes_present"], "table_bytes_present", DISK_RATIO_MAX),
-        ("phase-F read bytes <= %.1fx" % READ_RATIO_MAX, c["read_f"],
-         b and b["read_f"], "read_bytes_f", READ_RATIO_MAX),
+        ("phase-F read bytes <= %.1fx" % read_max, c["read_f"],
+         b and b["read_f"], "read_bytes_f", read_max),
         ("peak file count <= %.1fx" % FILES_RATIO_MAX, ic["max_files"],
          b and b["info"]["max_files"], "max_files", FILES_RATIO_MAX),
     ]
@@ -141,18 +153,22 @@ def geomean(values):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--quick", action="store_true",
+                    help="fast proxy: %s at scale 1" % ", ".join(QUICK_WORKLOADS))
     ap.add_argument("--workload", action="append", choices=WORKLOADS,
                     help="run only this workload (repeatable; default: all)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--scale", type=float, default=3.0)
+    ap.add_argument("--scale", type=float, default=None)
     ap.add_argument("--candidate-only", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the databases in the work directory")
     ap.add_argument("--work", default="/tmp/lsm-bench")
     ap.add_argument("--tree", default="/app/leveldb")
     ap.add_argument("--pristine", default="/opt/pristine")
     args = ap.parse_args()
+    if args.scale is None:
+        args.scale = 1.0 if args.quick else 3.0
     os.makedirs(args.work, exist_ok=True)
-    workloads = args.workload or WORKLOADS
+    workloads = args.workload or (QUICK_WORKLOADS if args.quick else WORKLOADS)
 
     print("building candidate (%s)" % args.tree)
     cand = build(args.tree, os.path.join(args.work, "build-cand"), os.path.join(args.work, "lsmbench-cand"))
@@ -179,7 +195,7 @@ def main():
             check(cand, b["db"], args.seed, args.scale, w, desc["batches"])
             print("  cross reads ok")
         sb = scored[w] if scored else None
-        for name, val, ok, fmt in guardrails(c, b, sb):
+        for name, val, ok, fmt in guardrails(c, b, sb, w):
             all_ok = all_ok and ok
             print("    %-36s %-5s %s" % (name, "ok" if ok else "FAIL", fmt % val))
         if sb is not None:
@@ -199,7 +215,7 @@ def main():
         print("estimated score: %.4f  (geometric mean over %s; untouched = 1.0, lower is better)" % (
             geomean(list(estimates.values())), ", ".join(estimates)))
     if len(workloads) < len(WORKLOADS):
-        print("note: only %s ran; the score covers all of %s" % (", ".join(workloads), ", ".join(WORKLOADS)))
+        print("note: only %s ran; the score covers all %d workloads" % (", ".join(workloads), len(WORKLOADS)))
     if not full:
         print("note: the verifier runs scale 3; smaller scales build fewer levels, so these numbers differ")
 
