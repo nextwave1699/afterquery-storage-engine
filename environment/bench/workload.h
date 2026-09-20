@@ -44,10 +44,10 @@ static const uint32_t kDeletedBit = 0x80000000u;
 static const uint32_t kMaxAnyValue = 8192;  // largest value any workload writes
 
 // `mixed` is the hand-written workload above.  The rest are recipes: a key
-// distribution plus rates for deletes, reads and batching.  They exist to
-// pull compaction policy in different directions -- what helps a workload
-// that overwrites a small hot set hurts one that appends and purges, and a
-// flush that spans the whole key range costs more in some than in others.
+// distribution plus rates for deletes, reads and batching.  They pull
+// compaction policy in different directions; what pays off on a workload
+// that overwrites a small hot set does not pay off on one that appends and
+// purges in key order.
 enum WorkloadKind {
   kMixed = 0, kUniform, kSeries, kBlob, kHotkey, kBursts,
   kTtl, kScan, kBimodal, kRolling, kSmallval, kWide, kNumWorkloads
@@ -720,7 +720,7 @@ class Workload {
   bool OtherLoadStep(Step* st) {
     Batch(st, 'A');
     const Recipe& r = recipe();
-    uint32_t per = r.vmax > 1024 ? 2 : 8;
+    uint32_t per = r.vmax > 1024 ? 2 : 8;  // fewer per batch for big values
     for (uint32_t i = 0; i < per && sub_ < shape_.n_load; i++) {
       AddPut(st, sub_);
       sub_++;
@@ -831,8 +831,8 @@ class Workload {
       if (rng_.Chance(r.del_pct)) {
         AddDel(st, ExistingId());
       } else if (r.dist == kDistBimodal) {
-        // half the writes extend the tail, half update a range low in the
-        // key space: one flushed memtable then spans nearly everything
+        // half extend the tail, half update a range low in the key space,
+        // so a memtable holds both ends of the range
         if (rng_.Chance(r.hot_pct) || head_ >= shape_.universe) {
           AddPut(st, hot_lo_ + rng_.Below(shape_.n_hot));
         } else {

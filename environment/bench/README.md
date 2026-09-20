@@ -20,7 +20,7 @@ baseline.
 
 `--quick` runs mixed, bursts, ttl and bimodal at scale 1: four different
 pressures (write volume, flush behaviour, tombstone scans, flushes that span
-the key range) in about two minutes.  It is a proxy, not the score -- fewer
+the key range) in about two minutes.  It is a proxy, not the score: fewer
 workloads, and a smaller scale builds fewer levels, so the ratios come out
 higher than at scale 3.  Use it to throw ideas away, then confirm the
 survivors with a full run.
