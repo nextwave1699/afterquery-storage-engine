@@ -46,7 +46,7 @@ echo "sealed tree: $(du -h "$ROOT/tests/sealed/leveldb.tar.gz" | cut -f1)"
 
 # 2. mirror the harness into the agent's tooling directory
 mkdir -p "$ROOT/environment/bench"
-for f in lsmbench.cc bench_env.h workload.h manifest.py measure.py; do
+for f in lsmbench.cc bench_env.h workload.h manifest.py measure.py conftest.cc conf_model.h conf_model.cc; do
   cp "$ROOT/tests/harness/$f" "$ROOT/environment/bench/$f"
 done
 

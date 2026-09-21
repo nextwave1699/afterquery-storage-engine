@@ -38,6 +38,20 @@ def test_functional(report):
     stage(report, "functional")
 
 
+def test_conformance(report):
+    """Every conformance scenario passes: reads, iterator walks, snapshots,
+    reopens and compactions all match the model."""
+    st = stage(report, "conformance")
+    assert st.get("passed") == st.get("total") and st.get("total"), \
+        "%s of %s scenarios passed" % (st.get("passed"), st.get("total"))
+
+
+def test_recovery(report):
+    """Every randomized crash is recovered to an acknowledged state, the same
+    one by both engines."""
+    stage(report, "recovery")
+
+
 def test_differential(report):
     """Each engine can read what the other wrote on a small workload."""
     stage(report, "differential")

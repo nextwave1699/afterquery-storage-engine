@@ -9,17 +9,16 @@ artifacts = [
 name = "afterquery/storage-engine"
 version = "1.0.0"
 description = """
-Change the compaction strategy of a pinned LevelDB (1.23) so that twelve \
-fixed LSM-tree workloads (random and skewed overwrites, sequential sweeps, \
-write bursts, tiny and 6 KB values, sparse writes, scan-heavy reads, \
-interleaved appends and low-key updates, and time-series appends with \
-TTL-style purges) are written with as few bytes as possible relative to the \
-untouched engine (score: geometric mean of the per-workload \
-write-amplification ratios), while every read stays correct, crash \
-recovery at every engine event works for both engines, the pristine engine \
-can read the candidate's databases and vice versa, and level-0 depth, \
-space, read bytes and memory stay inside the baseline's envelope on every \
-workload."""
+Optimize a pinned LSM-tree storage engine (LevelDB 1.23) across a large \
+heterogeneous workload corpus to substantially reduce geometric-mean write \
+amplification while preserving read/write correctness, snapshot and \
+iterator semantics, crash recovery, and on-disk compatibility.  The \
+optimization may require coordinated changes across the write path, \
+memtable flushing, SSTable construction, compaction scheduling, compaction \
+selection, level management, tombstone handling, background I/O, and \
+version/manifest management.  The candidate must pass the complete \
+conformance and recovery suite.  Performance is evaluated against a pinned \
+baseline and a declared expert reference score."""
 authors = [
   { name = "nextwave1699", email = "nextwave1699@gmail.com" },
 ]

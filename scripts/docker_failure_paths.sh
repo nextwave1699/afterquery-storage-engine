@@ -135,6 +135,26 @@ file(WRITE /tmp/lsm-verify-report.json "{\"summary\": {\"reward\": 1}}")
 execute_process(COMMAND sh -c "echo 1 > /logs/verifier/reward.txt; echo 1 > /logs/verifier/reward.json; touch /tests/planted" ERROR_QUIET)
 EOF
       ;;
+    snapdrop)  # compaction drops versions a live snapshot still needs
+      sed -i 's/if (last_sequence_for_key <= compact->smallest_snapshot) {/if (true) {/' "$t/db/db_impl.cc" ;;
+    recdrop)  # WAL recovery loses every seventh batch
+      python3 - "$t/db/db_impl.cc" <<'EOF2'
+import sys; p=sys.argv[1]; s=open(p).read()
+old="    status = WriteBatchInternal::InsertInto(&batch, mem);"
+assert old in s
+s=s.replace(old,"    static int n = 0; if (++n % 7 == 0) continue;\n"+old)
+open(p,"w").write(s)
+EOF2
+      ;;
+    iterdir)  # switching an iterator from forward to reverse skips an entry
+      python3 - "$t/db/db_iter.cc" <<'EOF2'
+import sys; p=sys.argv[1]; s=open(p).read()
+old="    direction_ = kReverse;\n  }"
+assert s.count(old) == 1
+s=s.replace(old,"    iter_->Prev();\n    if (!iter_->Valid()) { valid_ = false; saved_key_.clear(); ClearSavedValue(); return; }\n"+old)
+open(p,"w").write(s)
+EOF2
+      ;;
     verifier-exception) ;;  # handled by the extra arguments below
     *) echo "unknown case $name" >&2; return 1 ;;
   esac
@@ -169,7 +189,7 @@ except Exception as e: print('no report: %s' % e)
   printf '%-22s reward.txt=%s reward.json=%s expected=%s %s  %s\n' "$name" "$reward" "$jok" "$expect" "$verdict" "$why"
 }
 
-CASES="${*:-nop sample old-reference nobuild missing header-break wrong-get scan-bug no-compaction no-wal crash-in-compaction hang format-change big-memtable seek-only tiered-constants planted-reward verifier-exception}"
+CASES="${*:-nop sample old-reference snapdrop recdrop iterdir nobuild missing header-break wrong-get scan-bug no-compaction no-wal crash-in-compaction hang format-change big-memtable seek-only tiered-constants planted-reward verifier-exception}"
 for c in $CASES; do
   make_case "$c" || continue
   run_case "$c" &

@@ -9,6 +9,11 @@ each database back with the other engine, and prints the guardrails and an
 estimated score. That is the same measurement the verifier makes, and it
 takes a while: budget ~15 minutes.
 
+--suite runs a slice of the conformance and recovery suite instead of the
+benchmark: 400 scenarios and 40 crash-recovery cases on seeds the verifier
+does not use, crashes recovered by both engines.  The verifier runs 2400 and
+160; a pass here makes a pass there likely, not certain.
+
 --quick is the fast loop: four workloads at scale 1 (~2 min), chosen to
 cover the different pressures (mixed, bursts, ttl, bimodal). It moves in the
 same direction as the score but is not the score: fewer workloads, and a
@@ -83,6 +88,73 @@ def measured(binary, mode, db, seed, scale, workload, work, tag):
     return m
 
 
+def build_conftest(tree, build_dir, binary):
+    sh(["g++", "-std=c++17", "-O2", "-fno-rtti", "-I" + os.path.join(tree, "include"), "-I" + HERE,
+        os.path.join(HERE, "conftest.cc"), os.path.join(HERE, "conf_model.cc"), "-o", binary,
+        os.path.join(build_dir, "libleveldb.a"), "-lpthread"], quiet=True)
+    return binary
+
+
+def run_suite(cand, ref, work, scenarios=400, cases=40, jobs=4):
+    """The conformance and recovery checks, on seeds the verifier does not use."""
+    base = 3000000
+    step = (scenarios + jobs - 1) // jobs
+    procs = []
+    for i in range(jobs):
+        a, b = base + i * step, min(base + scenarios, base + (i + 1) * step)
+        db = os.path.join(work, "suite-%d" % i)
+        shutil.rmtree(db, ignore_errors=True)
+        os.makedirs(db)
+        procs.append(subprocess.Popen([cand, "scenarios", "--db", db, "--from", str(a), "--to", str(b), "--quiet"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
+    passed = total = 0
+    for p in procs:
+        out, _ = p.communicate()
+        for line in out.splitlines():
+            if " FAIL " in line:
+                print("  " + line)
+            if line.startswith("PASSED "):
+                a, b = line.split()[1].split("/")
+                passed, total = passed + int(a), total + int(b)
+    print("conformance: %d/%d scenarios" % (passed, total))
+    rng = __import__("random").Random(4100)
+    events = ["log_append", "table_append", "table_close", "table_sync", "manifest_append",
+              "manifest_sync", "remove_file", "rename"]
+    bad = 0
+    for i in range(cases):
+        seed = 4100000 + i
+        ev = rng.choice(events)
+        spec = "%s:%d%s" % (ev, 1 + rng.randrange(3 if ev in ("rename", "manifest_sync") else 60),
+                            ":after" if rng.random() < 0.3 else "")
+        db = os.path.join(work, "rec")
+        shutil.rmtree(db, ignore_errors=True)
+        ack = os.path.join(work, "rec.ack")
+        subprocess.run([cand, "crash", "--db", db, "--seed", str(seed), "--crash", spec, "--ack", ack],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        acked = open(ack).read().strip() or "0"
+        states = []
+        for tag, binary in (("candidate", cand), ("pristine", ref)):
+            if binary is None:
+                continue
+            copy = db + "-" + tag
+            shutil.rmtree(copy, ignore_errors=True)
+            shutil.copytree(db, copy)
+            p = subprocess.run([binary, "recover", "--db", copy, "--seed", str(seed), "--acked", acked],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            line = [l for l in p.stdout.splitlines() if l.startswith("RECOVERED ")]
+            if p.returncode != 0 or not line:
+                print("  recovery %d (%s): %s recovery failed: %s" % (i, spec, tag, p.stdout.strip()[-300:]))
+                bad += 1
+                break
+            states.append(line[0])
+        else:
+            if len(set(states)) > 1:
+                print("  recovery %d (%s): engines disagree: %s" % (i, spec, states))
+                bad += 1
+    print("recovery: %d/%d crash cases" % (cases - bad, cases))
+    return passed == total and bad == 0
+
+
 def check(binary, db, seed, scale, workload, batches):
     r = subprocess.run([binary, "check", "--db", db, "--seed", str(seed), "--scale", str(scale),
                         "--workload", workload, "--batches", str(batches), "--paranoid", "--quiet"],
@@ -153,6 +225,8 @@ def geomean(values):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--suite", action="store_true",
+                    help="run a slice of the conformance and recovery suite instead of the benchmark")
     ap.add_argument("--quick", action="store_true",
                     help="fast proxy: %s at scale 1" % ", ".join(QUICK_WORKLOADS))
     ap.add_argument("--workload", action="append", choices=WORKLOADS,
@@ -176,6 +250,16 @@ def main():
     if not args.candidate_only:
         print("building pristine (%s)" % args.pristine)
         ref = build(args.pristine, os.path.join(args.work, "build-ref"), os.path.join(args.work, "lsmbench-ref"))
+
+    if args.suite:
+        cconf = build_conftest(args.tree, os.path.join(args.work, "build-cand"), os.path.join(args.work, "conftest-cand"))
+        rconf = None
+        if ref:
+            rconf = build_conftest(args.pristine, os.path.join(args.work, "build-ref"),
+                                   os.path.join(args.work, "conftest-ref"))
+        ok = run_suite(cconf, rconf, args.work)
+        print("\nsuite: %s" % ("ok" if ok else "FAIL (the gate would fail)"))
+        sys.exit(0 if ok else 1)
 
     full = abs(args.scale - 3.0) < 1e-9
     scored = None
