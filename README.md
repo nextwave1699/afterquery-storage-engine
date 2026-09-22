@@ -135,6 +135,15 @@ verifier's per-chunk timeout turns into a failure):
 (One more, "reverse scan keeps operands after a deletion", is equivalent to
 the reference: the merge branch resets the operand list anyway.)
 
+Through the full verifier image (`scripts/docker_failure_paths.sh`), every
+mutant gets gate 0 with feature_score 0.45-0.72; the untouched tree 0.0; a
+stub that compiles 0.40; the naive engine 0.90 (efficiency only); breaking
+stock guarantees (format change, new MANIFEST tag on every table, no WAL,
+lost recovery batches, 64 MB memtables, no compaction, a compaction that
+aborts or hangs, planted reward files) all gate 0; the reference gate 1 and
+1.0.  A hanging candidate is bounded by per-stage deadlines (conformance and
+recovery 20 min each) and finishes in about an hour.
+
 ## Rebuilding
 
     scripts/seal.sh              # archives, fixtures, mirror tests/harness -> environment/bench
