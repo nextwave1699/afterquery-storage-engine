@@ -129,7 +129,7 @@ build_runtime_sec = 1800
 self_check = "/app/bench/bench.py"
 
 [verifier]
-timeout_sec = 5400.0
+timeout_sec = 7200.0
 environment_mode = "separate"
 
 [verifier.env]

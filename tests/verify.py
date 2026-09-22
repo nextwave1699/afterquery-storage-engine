@@ -87,7 +87,7 @@ MEMTABLE_SWITCH_RATIO_MIN = 0.8
 TIME_RATIO_MAX = 4.0           # wall time vs. pristine (plus 60 s)
 BUILD_TIMEOUT = int(os.environ.get("LSM_BUILD_TIMEOUT", "900"))
 RUN_TIMEOUT = int(os.environ.get("LSM_RUN_TIMEOUT", "900"))
-SMALL_TIMEOUT = int(os.environ.get("LSM_SMALL_TIMEOUT", "600"))
+SMALL_TIMEOUT = int(os.environ.get("LSM_SMALL_TIMEOUT", "300"))
 
 
 # The conformance and recovery suite (conftest).  Scenario seeds and crash
@@ -101,7 +101,11 @@ CONF_LONG_OPS = 3000
 STOCK_BASE = 990000
 STOCK_SCENARIOS = 1000         # stock API only
 CONF_JOBS = 8
-CONF_TIMEOUT = 900
+# Wall-clock budgets per stage, so a hanging candidate cannot keep the
+# verifier busy for hours: whatever has not finished by then counts as failed.
+CONF_DEADLINE = 1200
+RECOVERY_DEADLINE = 1200
+RECOVERY_CASE_TIMEOUT = 120
 RECOVERY_SEED = 520000
 RECOVERY_CASES = 400
 # Efficiency cases (conftest perf, scale 1).  A limit is either bytes or
@@ -113,7 +117,7 @@ PERF_LIMITS = {
     "merge": {"A_WCHAR": 150 << 20, "A_RCHAR": 256 << 20, "B_TABLE_BYTES": (1.25, 0),
               "VMHWM_KB": 1 << 20},
 }
-PERF_TIMEOUT = 900
+PERF_TIMEOUT = 300
 STAGES = ("build", "functional", "api", "conformance", "differential", "crash", "recovery", "compat",
           "efficiency", "benchmark")
 SCORED = ("api", "conformance", "recovery", "efficiency")
@@ -428,7 +432,7 @@ class Verifier:
                 st["passed"], st["total"], status, "; ".join(bad[:4]) or (out + err)[-600:]))
         st["ok"] = True
 
-    def run_scenarios(self, name, lo, hi, ops, ext, jobs=CONF_JOBS):
+    def run_scenarios(self, name, lo, hi, ops, ext, deadline, jobs=CONF_JOBS):
         """Runs seeds [lo, hi) in `jobs` processes; returns (passed, failures)."""
         step = (hi - lo + jobs - 1) // jobs
         procs = []
@@ -443,7 +447,7 @@ class Verifier:
         passed = 0
         failures = []
         for (p, log), n in procs:
-            status, out = self.wait_spawned(p, log, CONF_TIMEOUT)
+            status, out = self.wait_spawned(p, log, max(1, deadline - time.time()))
             got = [l for l in out.splitlines() if l.startswith("PASSED ")]
             fails = [l for l in out.splitlines() if " FAIL " in l]
             failures += fails
@@ -464,10 +468,11 @@ class Verifier:
                                                      "total": CONF_SCENARIOS + CONF_LONG + STOCK_SCENARIOS}
         self.need_conftest()
         results = {}
+        deadline = time.time() + CONF_DEADLINE
         for name, lo, n, ops, ext in (("conf", CONF_BASE, CONF_SCENARIOS, CONF_OPS, True),
                                       ("long", CONF_LONG_BASE, CONF_LONG, CONF_LONG_OPS, True),
                                       ("stock", STOCK_BASE, STOCK_SCENARIOS, CONF_OPS, False)):
-            passed, failures = self.run_scenarios(name, lo, lo + n, ops, ext)
+            passed, failures = self.run_scenarios(name, lo, lo + n, ops, ext, deadline)
             results[name] = {"passed": passed, "total": n, "failures": failures[:10]}
             st["passed"] += passed
             self.log("conformance %s: %d/%d scenarios" % (name, passed, n))
@@ -491,6 +496,7 @@ class Verifier:
                   "manifest_sync", "remove_file", "rename"]
         crashed = 0
         failures = []
+        deadline = time.time() + RECOVERY_DEADLINE
         for i in range(RECOVERY_CASES):
             seed = RECOVERY_SEED + i
             ev = rng.choice(events)
@@ -502,10 +508,17 @@ class Verifier:
             db = self.udir("rec-%d" % i)
             ack = os.path.join(self.udir("rec-ack-%d" % i), "ack")
             case = {"spec": spec, "kind": kind}
+            left = deadline - time.time()
+            if left <= 0:
+                failures.append("case %d: the stage ran out of time (%ds)" % (i, RECOVERY_DEADLINE))
+                case["ok"] = False
+                st["cases"].append(case)
+                continue
+            case_timeout = int(max(5, min(RECOVERY_CASE_TIMEOUT, left)))
             try:
                 status, out, err = self.run_as_user(
                     [self.conf_bin[writer], "crash", "--db", db, "--seed", str(seed), "--crash", spec,
-                     "--ack", ack, "--ops", str(CONF_OPS)] + ext, timeout=SMALL_TIMEOUT)
+                     "--ack", ack, "--ops", str(CONF_OPS)] + ext, timeout=case_timeout)
                 self.kill_user_procs()
                 if status not in (0, -9):
                     raise Fail("the run failed before crashing: %s" % (out + err)[-400:])
@@ -518,7 +531,7 @@ class Verifier:
                     copy = self.copy_db(db, "rec-%d-%s" % (i, reader))
                     status, out, err = self.run_as_user(
                         [self.conf_bin[reader], "recover", "--db", copy, "--seed", str(seed),
-                         "--acked", str(acked), "--ops", str(CONF_OPS)] + ext, timeout=SMALL_TIMEOUT)
+                         "--acked", str(acked), "--ops", str(CONF_OPS)] + ext, timeout=case_timeout)
                     self.kill_user_procs()
                     line = [l for l in out.splitlines() if l.startswith("RECOVERED ")]
                     if status != 0 or not line:
