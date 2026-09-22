@@ -1,0 +1,35 @@
+--- a/db/db_impl.cc
++++ b/db/db_impl.cc
+@@ -1457,7 +1457,14 @@
+ 
+ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin,
+                            const Slice& end) {
+-  return DB::DeleteRange(options, begin, end);
++  // naive: one point delete per live key
++  WriteBatch batch;
++  Iterator* it = NewIterator(ReadOptions());
++  for (it->Seek(begin); it->Valid() && user_comparator()->Compare(it->key(), end) < 0; it->Next()) {
++    batch.Delete(it->key());
++  }
++  delete it;
++  return Write(options, &batch);
+ }
+ 
+ Status DBImpl::Merge(const WriteOptions& options, const Slice& key,
+@@ -1465,7 +1472,15 @@
+   if (options_.merge_operator == nullptr) {
+     return Status::InvalidArgument("no merge_operator configured");
+   }
+-  return DB::Merge(options, key, value);
++  // naive: read, merge, write back
++  std::string cur, out;
++  Status s = Get(ReadOptions(), key, &cur);
++  std::vector<std::string> ops{value.ToString()};
++  Slice cs(cur);
++  if (!options_.merge_operator->FullMerge(key, s.ok() ? &cs : nullptr, ops, &out)) {
++    return Status::Corruption("merge");
++  }
++  return Put(options, key, out);
+ }
+ 
+ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {

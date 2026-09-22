@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
-"""Verifier driver for the storage-engine task.
+"""Verifier driver for the storage-engine task: range deletes and merge
+operators for LevelDB 1.23.
 
 Runs as root; anything that builds or links candidate code runs as the
 unprivileged `lsm` user. Stages, each skipped if one it needs failed:
 
-  build         pristine + candidate engines, our own lsmbench against each
+  build         pristine + candidate engines; our own lsmbench against each,
+                our own conftest against the candidate (full extension API)
+                and against the pristine (stock scenarios only)
   functional    lsmbench selftest on the candidate
-  differential  scale 0.25, each engine reads what the other wrote
-  crash         SIGKILL at various Env events, both engines must recover
-                the same batches (see CRASH_SCENARIOS)
+  api           fixed checks of the extension API (conftest api)
+  conformance   CONF_SCENARIOS seeded scenarios with range deletes and merge
+                operands, CONF_LONG long ones, STOCK_SCENARIOS without them;
+                every read checked against a model
+  differential  scale 0.25 stock workload, each engine reads what the other
+                wrote
+  crash         SIGKILL at eleven Env events in a stock workload, both
+                engines must recover the same batches (CRASH_SCENARIOS)
+  recovery      RECOVERY_CASES seeded crashes at random Env events, most in
+                scenarios with the extensions
   compat        sealed pristine-written dbs + one fresh one: candidate reads
                 and extends, pristine reads the result
-  benchmark     every workload in WORKLOADS at full scale and BENCH_SEED, both
-                engines; WA from the kernel counters, guardrails from the
-                MANIFEST history, per workload
+  efficiency    the rangedel and merge cases (conftest perf), kernel I/O
+                counters of each phase against PERF_LIMITS
+  benchmark     stock workloads (WORKLOADS) at full scale on both engines:
+                write amplification at most WA_RATIO_MAX x the pristine's,
+                plus the guardrails, so the stock paths do not regress
 
-The gate is every stage plus every workload's guardrails, which the untouched
-tree passes. The score is write_amp_ratio = geometric mean over the workloads
-of candidate WA / pristine WA from this same run (untouched: 1.0, lower is
-better). Only `mixed` is used by the correctness stages and the fixtures.
+The gate is every stage.  The objective, feature_score, is the mean over
+api, conformance, recovery and efficiency of the fraction of their checks
+that passed (0 for the untouched tree, which has no extension API; 1 when
+all pass).
 
 The report (--out) is rewritten after every stage. test.sh turns it into
 the reward files via test_outputs.py.
@@ -42,13 +54,13 @@ sys.path.insert(0, os.path.join(HERE, "harness"))
 import manifest  # noqa: E402
 
 
-# The scored benchmark always uses this seed, so repeat runs measure the
+# The regression benchmark always uses this seed, so repeat runs measure the
 # same bytes. It lives only here; bench.py defaults to seed 1.
 BENCH_SEED = 604729
-# Scored workloads and the pristine WA each should land in; outside the band
-# something is off with the box.
-WORKLOADS = ["mixed", "uniform", "series", "blob", "hotkey", "bursts",
-             "ttl", "scan", "bimodal", "rolling", "smallval", "wide"]
+# Stock workloads the candidate must not regress on, and the pristine WA each
+# should land in; outside the band something is off with the box.
+WORKLOADS = ["mixed", "ttl", "bimodal"]
+WA_RATIO_MAX = 1.10            # candidate WA vs pristine WA, per workload
 BASELINE_WA_BAND = {
     "mixed": (9.9, 19.7), "uniform": (7.3, 14.6), "series": (3.0, 6.1), "blob": (3.6, 7.2),
     "hotkey": (2.5, 5.0), "bursts": (10.8, 21.6), "ttl": (2.6, 5.2), "scan": (5.6, 11.2),
@@ -81,13 +93,30 @@ SMALL_TIMEOUT = int(os.environ.get("LSM_SMALL_TIMEOUT", "600"))
 # The conformance and recovery suite (conftest).  Scenario seeds and crash
 # points are fixed here, in the sealed verifier.
 CONF_BASE = 910000
-CONF_SCENARIOS = 2400
+CONF_SCENARIOS = 12000         # with range deletes and merges, CONF_OPS operations each
 CONF_OPS = 300
+CONF_LONG_BASE = 970000
+CONF_LONG = 400                # the same, CONF_LONG_OPS operations each
+CONF_LONG_OPS = 3000
+STOCK_BASE = 990000
+STOCK_SCENARIOS = 1000         # stock API only
 CONF_JOBS = 8
-CONF_TIMEOUT = 1800
+CONF_TIMEOUT = 900
 RECOVERY_SEED = 520000
-RECOVERY_CASES = 160
-CORRECTNESS_STAGES = ("build", "functional", "conformance", "differential", "crash", "recovery", "compat")
+RECOVERY_CASES = 400
+# Efficiency cases (conftest perf, scale 1).  A limit is either bytes or
+# (factor, slack): at most factor * LOAD_TABLE_BYTES + slack.
+PERF_LIMITS = {
+    "rangedel": {"A_WCHAR": 512 << 10, "A_RCHAR": 512 << 10, "S_RCHAR": (0.5, 0),
+                 "R_TABLE_BYTES": (0.3, 1 << 20), "B_TABLE_BYTES": (0.15, 1 << 20), "VMHWM_KB": 1 << 20},
+    "manyranges": {"M_CPU_MS": 15000, "VMHWM_KB": 1 << 20},
+    "merge": {"A_WCHAR": 150 << 20, "A_RCHAR": 256 << 20, "B_TABLE_BYTES": (1.25, 0),
+              "VMHWM_KB": 1 << 20},
+}
+PERF_TIMEOUT = 900
+STAGES = ("build", "functional", "api", "conformance", "differential", "crash", "recovery", "compat",
+          "efficiency", "benchmark")
+SCORED = ("api", "conformance", "recovery", "efficiency")
 
 
 class Fail(Exception):
@@ -103,6 +132,9 @@ class Verifier:
         self.user = args.user or None
         self.report = {"stages": {}, "log": [], "contract": {
             "bench_seed": BENCH_SEED, "bench_scale": BENCH_SCALE, "workloads": WORKLOADS,
+            "wa_ratio_max": WA_RATIO_MAX, "conf_scenarios": CONF_SCENARIOS, "conf_long": CONF_LONG,
+            "stock_scenarios": STOCK_SCENARIOS, "recovery_cases": RECOVERY_CASES,
+            "perf_limits": PERF_LIMITS,
             "read_ratio_max_by_workload": READ_RATIO_MAX_BY_WORKLOAD, "max_l0_depth": MAX_L0_DEPTH,
             "space_ratio_max": SPACE_RATIO_MAX, "read_ratio_max": READ_RATIO_MAX,
             "files_ratio_max": FILES_RATIO_MAX, "max_file_size": MAX_FILE_SIZE,
@@ -115,6 +147,7 @@ class Verifier:
         self.ref_bin = None
         self.cand_bin = None
         self.conf_bin = {}
+        self.conf_error = None
         rng = random.SystemRandom()
         self.seed = args.seed if args.seed else rng.randint(1000, 999999)
         self.small_seed = self.seed + 7
@@ -345,13 +378,24 @@ class Verifier:
         if status != 0 or not os.path.isfile(binary):
             raise Fail("harness does not compile against the %s tree (status %s): %s" % (tag, status, err[-1500:]))
         os.chmod(binary, 0o755)
-        # the conformance and recovery suite, same rules
+        # the conformance and recovery suite, same rules; the pristine tree
+        # has no extension API, so it gets the stock-only build
         conf = os.path.join(self.work, "conftest-" + tag)
         cc = ["g++", "-std=c++17", "-O2", "-fno-rtti", "-I" + os.path.join(tree, "include"), "-I" + hs,
               os.path.join(hs, "conftest.cc"), os.path.join(hs, "conf_model.cc"), "-o", conf, lib, "-lpthread"]
+        if tag == "ref":
+            cc.insert(1, "-DCONF_PRISTINE")
         status, out, err = self.run_as_user(cc, BUILD_TIMEOUT, log_name="conftest-%s.log" % tag, as_root=True)
         if status != 0 or not os.path.isfile(conf):
-            raise Fail("conformance suite does not compile against the %s tree (status %s): %s" % (tag, status, err[-1500:]))
+            if tag == "ref":
+                raise Fail("conformance suite does not compile against the pristine tree: %s" % err[-1500:])
+            # The engine builds but does not offer the extension API (or
+            # offers it with other signatures).  Stages that need it fail.
+            self.conf_error = "the conformance suite does not compile against the candidate's include/: %s" % (
+                err[-2500:])
+            self.report["stages"]["build"]["conftest_error"] = self.conf_error
+            self.log("conftest does not compile against the candidate")
+            return binary
         os.chmod(conf, 0o755)
         self.conf_bin[tag] = conf
         return binary
@@ -363,88 +407,181 @@ class Verifier:
         self.expect_ok(m, "selftest")
         st["ok"] = True
 
-    def conformance(self):
-        """Every scenario seed must pass on the candidate."""
-        st = self.report["stages"]["conformance"] = {"ok": None}
-        lo, hi = CONF_BASE, CONF_BASE + CONF_SCENARIOS
-        chunks = CONF_JOBS
-        step = (hi - lo + chunks - 1) // chunks
+    def need_conftest(self):
+        if "cand" not in self.conf_bin:
+            raise Fail(self.conf_error or "conformance suite unavailable")
+
+    def api(self):
+        st = self.report["stages"]["api"] = {"ok": None, "passed": 0, "total": 0}
+        self.need_conftest()
+        db = self.udir("api")
+        status, out, err = self.run_as_user([self.conf_bin["cand"], "api", "--db", db], timeout=SMALL_TIMEOUT,
+                                            log_name="api.log")
+        self.kill_user_procs()
+        lines = [l for l in out.splitlines() if l.startswith("API ")]
+        st["checks"] = lines
+        st["passed"] = sum(1 for l in lines if l.split()[2:3] == ["ok"])
+        st["total"] = max(len(lines), 13)
+        if status != 0 or st["passed"] != st["total"]:
+            bad = [l for l in lines if " FAIL" in l]
+            raise Fail("API checks: %d of %d passed (status %s): %s" % (
+                st["passed"], st["total"], status, "; ".join(bad[:4]) or (out + err)[-600:]))
+        st["ok"] = True
+
+    def run_scenarios(self, name, lo, hi, ops, ext, jobs=CONF_JOBS):
+        """Runs seeds [lo, hi) in `jobs` processes; returns (passed, failures)."""
+        step = (hi - lo + jobs - 1) // jobs
         procs = []
-        for i in range(chunks):
+        for i in range(jobs):
             a, b = lo + i * step, min(hi, lo + (i + 1) * step)
             if a >= b:
                 continue
-            db = self.udir("conf-%d" % i)
+            db = self.udir("%s-%d" % (name, i))
             cmd = [self.conf_bin["cand"], "scenarios", "--db", db, "--from", str(a), "--to", str(b),
-                   "--ops", str(CONF_OPS), "--quiet"]
-            procs.append(self.spawn_as_user(cmd, "conformance-%d.log" % i))
-        passed = total = 0
+                   "--ops", str(ops), "--quiet"] + (["--ext"] if ext else [])
+            procs.append((self.spawn_as_user(cmd, "%s-%d.log" % (name, i)), b - a))
+        passed = 0
         failures = []
-        for p, log in procs:
+        for (p, log), n in procs:
             status, out = self.wait_spawned(p, log, CONF_TIMEOUT)
             got = [l for l in out.splitlines() if l.startswith("PASSED ")]
-            if not got:
-                raise Fail("conformance chunk died (status %s): %s" % (status, out[-600:]))
-            a, b = got[-1].split()[1].split("/")
-            passed += int(a)
-            total += int(b)
-            failures += [l for l in out.splitlines() if " FAIL " in l]
+            fails = [l for l in out.splitlines() if " FAIL " in l]
+            failures += fails
+            if got:
+                passed += int(got[-1].split()[1].split("/")[0])
+            else:
+                # the chunk died (crash, timeout): count what finished before
+                done = [l for l in out.splitlines() if l.startswith("SCENARIO ")]
+                passed += sum(1 for l in done if l.endswith(" ok"))
+                failures.append("%s chunk of %d scenarios died (status %s) after %d: %s" % (
+                    name, n, status, len(done), out[-300:].replace("\n", " | ")))
         self.kill_user_procs()
-        st["passed"], st["total"] = passed, total
-        st["failures"] = failures[:25]
-        self.log("conformance: %d/%d scenarios" % (passed, total))
-        if total != CONF_SCENARIOS or passed != total:
+        return passed, failures
+
+    def conformance(self):
+        """Every scenario seed must pass on the candidate."""
+        st = self.report["stages"]["conformance"] = {"ok": None, "passed": 0,
+                                                     "total": CONF_SCENARIOS + CONF_LONG + STOCK_SCENARIOS}
+        self.need_conftest()
+        results = {}
+        for name, lo, n, ops, ext in (("conf", CONF_BASE, CONF_SCENARIOS, CONF_OPS, True),
+                                      ("long", CONF_LONG_BASE, CONF_LONG, CONF_LONG_OPS, True),
+                                      ("stock", STOCK_BASE, STOCK_SCENARIOS, CONF_OPS, False)):
+            passed, failures = self.run_scenarios(name, lo, lo + n, ops, ext)
+            results[name] = {"passed": passed, "total": n, "failures": failures[:10]}
+            st["passed"] += passed
+            self.log("conformance %s: %d/%d scenarios" % (name, passed, n))
+            self.save()
+        st["sets"] = results
+        failures = [f for r in results.values() for f in r["failures"]]
+        if st["passed"] != st["total"]:
             raise Fail("conformance: %d of %d scenarios passed; first failures: %s" % (
-                passed, total, "; ".join(failures[:3])))
+                st["passed"], st["total"], "; ".join(failures[:3])))
         st["ok"] = True
 
     def recovery(self):
         """Crash scenarios at random Env events.  Whatever the candidate left
-        behind must be recovered by the candidate and by the pristine engine
-        to the same acknowledged state, and a pristine crash must be recovered
-        by the candidate."""
-        st = self.report["stages"]["recovery"] = {"ok": None, "cases": []}
+        behind must be recovered by the candidate to an acknowledged state;
+        in stock scenarios the pristine engine must recover the same one, and
+        the candidate must recover what a crashed pristine left."""
+        st = self.report["stages"]["recovery"] = {"ok": None, "cases": [], "passed": 0, "total": RECOVERY_CASES}
+        self.need_conftest()
         rng = random.Random(RECOVERY_SEED)
         events = ["log_append", "table_append", "table_close", "table_sync", "manifest_append",
                   "manifest_sync", "remove_file", "rename"]
         crashed = 0
+        failures = []
         for i in range(RECOVERY_CASES):
             seed = RECOVERY_SEED + i
             ev = rng.choice(events)
             n = 1 + rng.randrange(3 if ev in ("rename", "manifest_sync") else 60)
             spec = "%s:%d%s" % (ev, n, ":after" if rng.random() < 0.3 else "")
-            writer = "ref" if i % 4 == 3 else "cand"
+            kind = ("ext", "ext", "ext", "stock", "pristine")[i % 5]
+            writer = "ref" if kind == "pristine" else "cand"
+            ext = ["--ext"] if kind == "ext" else []
             db = self.udir("rec-%d" % i)
             ack = os.path.join(self.udir("rec-ack-%d" % i), "ack")
-            status, out, err = self.run_as_user(
-                [self.conf_bin[writer], "crash", "--db", db, "--seed", str(seed), "--crash", spec,
-                 "--ack", ack, "--ops", str(CONF_OPS)], timeout=SMALL_TIMEOUT)
-            self.kill_user_procs()
-            if status not in (0, -9):
-                raise Fail("recovery %d (%s by %s): the run failed before crashing: %s" % (
-                    i, spec, writer, (out + err)[-400:]))
-            crashed += status == -9
-            acked = self.read_ack(ack)
-            got = {}
-            readers = ("cand", "ref") if writer == "cand" else ("cand",)
-            for reader in readers:
-                copy = self.copy_db(db, "rec-%d-%s" % (i, reader))
+            case = {"spec": spec, "kind": kind}
+            try:
                 status, out, err = self.run_as_user(
-                    [self.conf_bin[reader], "recover", "--db", copy, "--seed", str(seed),
-                     "--acked", str(acked), "--ops", str(CONF_OPS)], timeout=SMALL_TIMEOUT)
+                    [self.conf_bin[writer], "crash", "--db", db, "--seed", str(seed), "--crash", spec,
+                     "--ack", ack, "--ops", str(CONF_OPS)] + ext, timeout=SMALL_TIMEOUT)
                 self.kill_user_procs()
-                line = [l for l in out.splitlines() if l.startswith("RECOVERED ")]
-                if status != 0 or not line:
-                    raise Fail("recovery %d (%s, written by %s, %d writes acked): %s recovery failed: %s" % (
-                        i, spec, writer, acked, reader, (out + err)[-500:]))
-                got[reader] = int(line[0].split()[1])
-                shutil.rmtree(copy, ignore_errors=True)
-            if len(set(got.values())) != 1:
-                raise Fail("recovery %d (%s): the engines recovered different states %s" % (i, spec, got))
-            st["cases"].append({"spec": spec, "writer": writer, "acked": acked, "recovered": got})
+                if status not in (0, -9):
+                    raise Fail("the run failed before crashing: %s" % (out + err)[-400:])
+                crashed += status == -9
+                acked = self.read_ack(ack)
+                case["acked"] = acked
+                got = {}
+                readers = ("cand", "ref") if kind == "stock" else ("cand",)
+                for reader in readers:
+                    copy = self.copy_db(db, "rec-%d-%s" % (i, reader))
+                    status, out, err = self.run_as_user(
+                        [self.conf_bin[reader], "recover", "--db", copy, "--seed", str(seed),
+                         "--acked", str(acked), "--ops", str(CONF_OPS)] + ext, timeout=SMALL_TIMEOUT)
+                    self.kill_user_procs()
+                    line = [l for l in out.splitlines() if l.startswith("RECOVERED ")]
+                    if status != 0 or not line:
+                        raise Fail("%s recovery failed (%d writes acked): %s" % (reader, acked, (out + err)[-500:]))
+                    got[reader] = int(line[0].split()[1])
+                    shutil.rmtree(copy, ignore_errors=True)
+                case["recovered"] = got
+                if len(set(got.values())) != 1:
+                    raise Fail("the engines recovered different states %s" % got)
+                case["ok"] = True
+                st["passed"] += 1
+            except Fail as e:
+                case["ok"] = False
+                case["error"] = str(e)
+                failures.append("case %d (%s, %s): %s" % (i, spec, kind, e))
+            st["cases"].append(case)
             shutil.rmtree(db, ignore_errors=True)
         st["crashed"] = crashed
-        self.log("recovery: %d cases, %d crashed at their event" % (RECOVERY_CASES, crashed))
+        self.log("recovery: %d/%d cases, %d crashed at their event" % (st["passed"], RECOVERY_CASES, crashed))
+        if failures:
+            raise Fail("recovery: %d of %d cases passed; first failures: %s" % (
+                st["passed"], RECOVERY_CASES, "; ".join(failures[:3])))
+        st["ok"] = True
+
+    def efficiency(self):
+        """The perf cases: each phase's kernel I/O counters within limits."""
+        st = self.report["stages"]["efficiency"] = {"ok": None, "cases": {}, "passed": 0, "total": 0}
+        self.need_conftest()
+        failures = []
+        for case, limits in PERF_LIMITS.items():
+            st["total"] += len(limits) + 1
+            r = st["cases"][case] = {}
+            db = self.udir("perf-" + case)
+            t = time.time()
+            status, out, err = self.run_as_user([self.conf_bin["cand"], "perf", "--db", db, "--case", case],
+                                                timeout=PERF_TIMEOUT, log_name="perf-%s.log" % case)
+            self.kill_user_procs()
+            r["wall_s"] = time.time() - t
+            metrics = {}
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 3 and parts[0] == "METRIC":
+                    metrics[parts[1]] = int(parts[2])
+            r["metrics"] = metrics
+            if status != 0 or "PERF ok" not in out:
+                failures.append("%s: the case failed (status %s): %s" % (case, status, (out + err)[-400:]))
+                continue
+            st["passed"] += 1
+            checks = r["checks"] = {}
+            for key, limit in limits.items():
+                if isinstance(limit, tuple):
+                    limit = int(limit[0] * metrics.get("LOAD_TABLE_BYTES", 0) + limit[1])
+                val = metrics.get(key)
+                ok = val is not None and val <= limit
+                checks[key] = {"value": val, "limit": limit, "ok": ok}
+                if ok:
+                    st["passed"] += 1
+                else:
+                    failures.append("%s: %s = %s, limit %d" % (case, key, val, limit))
+            self.log("efficiency %s: %s" % (case, ", ".join("%s %s/%s" % (k, c["value"], c["limit"])
+                                                            for k, c in checks.items())))
+        if failures:
+            raise Fail("efficiency: " + "; ".join(failures))
         st["ok"] = True
 
     def spawn_as_user(self, cmd, log_name):
@@ -631,7 +768,7 @@ class Verifier:
         st["ok"] = True
         if fails:
             self.log("guardrail failures: " + "; ".join(fails))
-        self.log("score (geometric mean of ratios) %.4f: %s" % (
+        self.log("write amplification vs pristine (geometric mean) %.4f: %s" % (
             st["wa_ratio"], ", ".join("%s %.4f" % (w, ws[w]["wa_ratio"]) for w in WORKLOADS)))
 
     def bench_workload(self, w):
@@ -700,6 +837,8 @@ class Verifier:
         g["time_ratio"] = cand["wall_s"] / max(1.0, base["wall_s"])
         g["disk_ratio"] = mr_c["table_bytes_present"] / float(max(1, mr_b["table_bytes_present"]))
         fails = []
+        if st["wa_ratio"] > WA_RATIO_MAX:
+            fails.append("write amplification %.3fx the pristine's > %.2f" % (st["wa_ratio"], WA_RATIO_MAX))
         if g["disk_ratio"] > DISK_RATIO_MAX:
             fails.append("table bytes on disk after the run %.2fx baseline > %.2f" % (g["disk_ratio"], DISK_RATIO_MAX))
         if g["max_l0_depth"] > MAX_L0_DEPTH:
@@ -732,32 +871,41 @@ class Verifier:
         if self.stage_ok("build"):
             with self.stage("functional"):
                 self.functional()
-        if self.stage_ok("functional"):
+            with self.stage("api"):
+                self.api()
             with self.stage("conformance"):
                 self.conformance()
+        if self.stage_ok("functional"):
             with self.stage("differential"):
                 self.differential()
+        if self.stage_ok("build"):
+            with self.stage("recovery"):
+                self.recovery()
         if self.stage_ok("differential"):
             with self.stage("crash"):
                 self.crash()
-            with self.stage("recovery"):
-                self.recovery()
             with self.stage("compat"):
                 self.compat()
-        if all(self.stage_ok(n) for n in ("conformance", "crash", "recovery", "compat")):
+        if self.stage_ok("build"):
+            with self.stage("efficiency"):
+                self.efficiency()
+        if all(self.stage_ok(n) for n in ("functional", "differential", "crash", "compat")):
             with self.stage("benchmark"):
                 self.benchmark()
         s = self.report["stages"]
-        correctness = all(self.stage_ok(n) for n in CORRECTNESS_STAGES)
+        gate = all(self.stage_ok(n) for n in STAGES)
         bench = s.get("benchmark", {})
-        guard_ok = bool(bench.get("ok")) and bool(bench.get("guardrails", {}).get("ok"))
+        fractions = {}
+        for n in SCORED:
+            st = s.get(n, {})
+            total = st.get("total") or 0
+            fractions[n] = (st.get("passed", 0) / float(total)) if total else 0.0
         self.report["summary"] = {
-            "correctness_passed": correctness,
-            "guardrails_passed": guard_ok,
-            "reward": 1 if (correctness and guard_ok) else 0,
+            "gate_passed": gate,
+            "reward": 1 if gate else 0,
+            "feature_score": sum(fractions.values()) / len(SCORED),
+            "fractions": fractions,
             "wa_ratio": bench.get("wa_ratio"),
-            "candidate_wa": bench.get("candidate_wa"),
-            "baseline_wa": bench.get("baseline_wa"),
             "elapsed_s": time.time() - self.t0,
         }
         self.save()

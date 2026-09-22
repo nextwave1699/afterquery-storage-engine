@@ -1,8 +1,7 @@
 """Checks on the report verify.py writes to $LSM_REPORT.
 
 These are the gate: test.sh sets gate_passed (and reward.txt) to 1 only if
-all of them pass. They don't look at how low the write amplification is;
-that's the objective, reported separately as write_amp_ratio."""
+all of them pass.  The objective, feature_score, is reported separately."""
 import json
 import os
 
@@ -30,7 +29,14 @@ def stage(report, name):
 
 def test_build(report):
     """The candidate engine builds and the harness compiles against it."""
-    stage(report, "build")
+    st = stage(report, "build")
+    assert not st.get("conftest_error"), st.get("conftest_error", "")[:2000]
+
+
+def test_api(report):
+    """The fixed checks of the range-delete and merge API pass."""
+    st = stage(report, "api")
+    assert st.get("passed") == st.get("total") and st.get("total")
 
 
 def test_functional(report):
@@ -47,9 +53,16 @@ def test_conformance(report):
 
 
 def test_recovery(report):
-    """Every randomized crash is recovered to an acknowledged state, the same
-    one by both engines."""
-    stage(report, "recovery")
+    """Every randomized crash is recovered to an acknowledged state (the same
+    one by both engines where both can read the database)."""
+    st = stage(report, "recovery")
+    assert st.get("passed") == st.get("total") and st.get("total")
+
+
+def test_efficiency(report):
+    """Range deletes and merges stay within their I/O limits."""
+    st = stage(report, "efficiency")
+    assert st.get("passed") == st.get("total") and st.get("total")
 
 
 def test_differential(report):
@@ -71,7 +84,7 @@ def test_compat(report):
 
 
 def test_benchmark_ran(report):
-    """Every scored workload ran on both engines and was measured."""
+    """Every stock workload ran on both engines and was measured."""
     st = stage(report, "benchmark")
     assert st.get("wa_ratio") is not None
     want = report.get("contract", {}).get("workloads") or []
@@ -81,7 +94,8 @@ def test_benchmark_ran(report):
 
 
 def test_guardrails(report):
-    """L0 depth, space, reads, files, RSS, memtables and time within limits."""
+    """No regression on the stock workloads: write amplification, L0 depth,
+    space, reads, files, RSS, memtables and time within limits."""
     st = stage(report, "benchmark")
     g = st.get("guardrails", {})
     assert g.get("ok") is True, "guardrail failures: %s" % g.get("failures")

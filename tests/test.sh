@@ -4,16 +4,16 @@
 # /app/leveldb.
 #
 # Writes to /logs/verifier:
-#   reward.txt   the gate: 1 if every stage and guardrail passes, else 0
-#   reward.json  gate_passed (same value), the objective write_amp_ratio (the
-#                geometric mean over the workloads), one write_amp_ratio_<w>
-#                per workload, and informational metrics (stage flags...)
+#   reward.txt   the gate: 1 if every stage passes, else 0
+#   reward.json  gate_passed (same value), the objective feature_score (mean
+#                over the api, conformance, recovery and efficiency stages of
+#                the fraction of their checks that passed), one flag per
+#                stage and the counts behind the score
 #   report.json  verify.py's full report
 #   pytest.txt   pytest output
 #
 # We write a zero reward up front and overwrite it at the end, so if anything
-# blows up in between there's still a valid 0 on disk. write_amp_ratio is 1.0
-# (no improvement) whenever the gate is red.
+# blows up in between there's still a valid 0 on disk.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWARD_DIR="${LSM_REWARD_DIR:-/logs/verifier}"
@@ -29,30 +29,27 @@ write_zero() {
 {
   "reward": 0,
   "gate_passed": 0,
+  "feature_score": 0.0,
   "build_ok": 0,
+  "extension_api_ok": 0,
   "functional_ok": 0,
+  "api_ok": 0,
   "conformance_ok": 0,
   "differential_ok": 0,
   "crash_recovery_ok": 0,
   "recovery_suite_ok": 0,
   "compat_ok": 0,
-  "guardrails_ok": 0,
-  "write_amp_ratio": 1.0,
-  "write_amp_ratio_mixed": 1.0,
-  "write_amp_ratio_uniform": 1.0,
-  "write_amp_ratio_series": 1.0,
-  "write_amp_ratio_blob": 1.0,
-  "write_amp_ratio_hotkey": 1.0,
-  "write_amp_ratio_bursts": 1.0,
-  "write_amp_ratio_ttl": 1.0,
-  "write_amp_ratio_scan": 1.0,
-  "write_amp_ratio_bimodal": 1.0,
-  "write_amp_ratio_rolling": 1.0,
-  "write_amp_ratio_smallval": 1.0,
-  "write_amp_ratio_wide": 1.0,
-  "write_amp": 0.0,
-  "baseline_write_amp": 0.0,
-  "wa_reduction": 0.0
+  "efficiency_ok": 0,
+  "benchmark_ok": 0,
+  "api_passed": 0,
+  "api_total": 0,
+  "scenarios_passed": 0,
+  "scenarios_total": 0,
+  "recovery_passed": 0,
+  "recovery_total": 0,
+  "efficiency_passed": 0,
+  "efficiency_total": 0,
+  "write_amp_ratio": 1.0
 }
 JSON
 }
@@ -78,35 +75,41 @@ except Exception:
     r = {}
 stages = r.get("stages", {})
 bench = stages.get("benchmark", {})
+summary = r.get("summary", {})
 def flag(name):
     return 1 if stages.get(name, {}).get("ok") is True else 0
 def num(v, default=0.0):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+def count(name, key):
+    return int(num(stages.get(name, {}).get(key), 0))
 reward = 1 if status == 0 else 0
-wa = num(bench.get("candidate_wa"))
-base = num(bench.get("baseline_wa"))
-ratio = num(bench.get("wa_ratio"), 1.0)
 out = {
     "reward": reward,
     "gate_passed": reward,
+    # the objective: 1.0 when every extension check passes
+    "feature_score": min(1.0, max(0.0, num(summary.get("feature_score"), 0.0))),
     "build_ok": flag("build"),
+    "extension_api_ok": 1 if flag("build") and not stages.get("build", {}).get("conftest_error") else 0,
     "functional_ok": flag("functional"),
+    "api_ok": flag("api"),
     "conformance_ok": flag("conformance"),
     "differential_ok": flag("differential"),
     "crash_recovery_ok": flag("crash"),
     "recovery_suite_ok": flag("recovery"),
     "compat_ok": flag("compat"),
-    "guardrails_ok": 1 if bench.get("guardrails", {}).get("ok") is True else 0,
-    # the objective; only meaningful when the gate passed
-    "write_amp_ratio": ratio if reward else 1.0,
-    "write_amp": wa,
-    "baseline_write_amp": base,
-    "wa_reduction": (1.0 - wa / base) if (wa > 0 and base > 0) else 0.0,
+    "efficiency_ok": flag("efficiency"),
+    "benchmark_ok": 1 if flag("benchmark") and bench.get("guardrails", {}).get("ok") is True else 0,
+    "api_passed": count("api", "passed"),
+    "api_total": count("api", "total"),
+    "scenarios_passed": count("conformance", "passed"),
+    "scenarios_total": count("conformance", "total"),
+    "recovery_passed": count("recovery", "passed"),
+    "recovery_total": count("recovery", "total"),
+    "efficiency_passed": count("efficiency", "passed"),
+    "efficiency_total": count("efficiency", "total"),
+    # stock workloads, candidate WA / pristine WA (informational)
+    "write_amp_ratio": num(bench.get("wa_ratio"), 1.0),
 }
-# per-workload ratios, same rule: 1.0 unless the gate passed
-for w in ("mixed", "uniform", "series", "blob", "hotkey", "bursts", "ttl", "scan", "bimodal", "rolling", "smallval", "wide"):
-    wr = num(bench.get("workloads", {}).get(w, {}).get("wa_ratio"), 1.0)
-    out["write_amp_ratio_" + w] = wr if reward else 1.0
 tmp = out_path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(out, f, indent=2, sort_keys=True)

@@ -1,0 +1,3272 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f8285b8..0f8476d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -128,6 +128,10 @@ target_sources(leveldb
+     "db/db_iter.cc"
+     "db/db_iter.h"
+     "db/dbformat.cc"
++    "db/lookup_state.h"
++    "db/range_del.cc"
++    "db/range_del.h"
++    "db/range_del_view.h"
+     "db/dbformat.h"
+     "db/dumpfile.cc"
+     "db/filename.cc"
+@@ -183,6 +187,7 @@ target_sources(leveldb
+     "util/hash.cc"
+     "util/hash.h"
+     "util/logging.cc"
++    "util/merge_operator.cc"
+     "util/logging.h"
+     "util/mutexlock.h"
+     "util/no_destructor.h"
+@@ -201,6 +206,7 @@ target_sources(leveldb
+     "${LEVELDB_PUBLIC_INCLUDE_DIR}/export.h"
+     "${LEVELDB_PUBLIC_INCLUDE_DIR}/filter_policy.h"
+     "${LEVELDB_PUBLIC_INCLUDE_DIR}/iterator.h"
++    "${LEVELDB_PUBLIC_INCLUDE_DIR}/merge_operator.h"
+     "${LEVELDB_PUBLIC_INCLUDE_DIR}/options.h"
+     "${LEVELDB_PUBLIC_INCLUDE_DIR}/slice.h"
+     "${LEVELDB_PUBLIC_INCLUDE_DIR}/status.h"
+@@ -462,6 +468,7 @@ if(LEVELDB_INSTALL)
+       "${LEVELDB_PUBLIC_INCLUDE_DIR}/export.h"
+       "${LEVELDB_PUBLIC_INCLUDE_DIR}/filter_policy.h"
+       "${LEVELDB_PUBLIC_INCLUDE_DIR}/iterator.h"
++    "${LEVELDB_PUBLIC_INCLUDE_DIR}/merge_operator.h"
+       "${LEVELDB_PUBLIC_INCLUDE_DIR}/options.h"
+       "${LEVELDB_PUBLIC_INCLUDE_DIR}/slice.h"
+       "${LEVELDB_PUBLIC_INCLUDE_DIR}/status.h"
+diff --git a/db/builder.cc b/db/builder.cc
+index e6329e0..08fe5d1 100644
+--- a/db/builder.cc
++++ b/db/builder.cc
+@@ -14,14 +14,33 @@
+ 
+ namespace leveldb {
+ 
++void AddTombstoneBounds(const InternalKeyComparator& icmp,
++                        const std::vector<RangeTombstone>& tombstones,
++                        bool have_keys, InternalKey* smallest,
++                        InternalKey* largest) {
++  for (const RangeTombstone& t : tombstones) {
++    InternalKey lo(t.begin, t.seq, kTypeRangeDeletion);
++    InternalKey hi(t.end, kMaxSequenceNumber, kTypeRangeDeletion);
++    if (!have_keys || icmp.Compare(lo, *smallest) < 0) {
++      *smallest = lo;
++    }
++    if (!have_keys || icmp.Compare(hi, *largest) > 0) {
++      *largest = hi;
++    }
++    have_keys = true;
++  }
++}
++
+ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
+-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta) {
++                  TableCache* table_cache, Iterator* iter, FileMetaData* meta,
++                  const std::vector<RangeTombstone>& tombstones) {
+   Status s;
+   meta->file_size = 0;
++  meta->has_range_dels = false;
+   iter->SeekToFirst();
+ 
+   std::string fname = TableFileName(dbname, meta->number);
+-  if (iter->Valid()) {
++  if (iter->Valid() || !tombstones.empty()) {
+     WritableFile* file;
+     s = env->NewWritableFile(fname, &file);
+     if (!s.ok()) {
+@@ -29,7 +48,8 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
+     }
+ 
+     TableBuilder* builder = new TableBuilder(options, file);
+-    meta->smallest.DecodeFrom(iter->key());
++    bool have_keys = iter->Valid();
++    if (have_keys) meta->smallest.DecodeFrom(iter->key());
+     Slice key;
+     for (; iter->Valid(); iter->Next()) {
+       key = iter->key();
+@@ -38,6 +58,16 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
+     if (!key.empty()) {
+       meta->largest.DecodeFrom(key);
+     }
++    if (!tombstones.empty()) {
++      std::string block;
++      EncodeRangeTombstones(tombstones, &block);
++      builder->SetRangeDeletionBlock(block);
++      const InternalKeyComparator* icmp =
++          static_cast<const InternalKeyComparator*>(options.comparator);
++      AddTombstoneBounds(*icmp, tombstones, have_keys, &meta->smallest,
++                         &meta->largest);
++      meta->has_range_dels = true;
++    }
+ 
+     // Finish and check for builder errors
+     s = builder->Finish();
+diff --git a/db/builder.h b/db/builder.h
+index 7bd0b80..f66c201 100644
+--- a/db/builder.h
++++ b/db/builder.h
+@@ -5,6 +5,9 @@
+ #ifndef STORAGE_LEVELDB_DB_BUILDER_H_
+ #define STORAGE_LEVELDB_DB_BUILDER_H_
+ 
++#include <vector>
++
++#include "db/range_del.h"
+ #include "leveldb/status.h"
+ 
+ namespace leveldb {
+@@ -13,6 +16,8 @@ struct Options;
+ struct FileMetaData;
+ 
+ class Env;
++class InternalKey;
++class InternalKeyComparator;
+ class Iterator;
+ class TableCache;
+ class VersionEdit;
+@@ -20,10 +25,20 @@ class VersionEdit;
+ // Build a Table file from the contents of *iter.  The generated file
+ // will be named according to meta->number.  On success, the rest of
+ // *meta will be filled with metadata about the generated table.
+-// If no data is present in *iter, meta->file_size will be set to
+-// zero, and no Table file will be produced.
++// `tombstones` go to the table's range-deletion block.
++// If no data is present in *iter and there are no tombstones,
++// meta->file_size will be set to zero, and no Table file will be produced.
+ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
+-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta);
++                  TableCache* table_cache, Iterator* iter, FileMetaData* meta,
++                  const std::vector<RangeTombstone>& tombstones =
++                      std::vector<RangeTombstone>());
++
++// Widens [*smallest, *largest] to cover `tombstones` (see FileMetaData).
++// `have_keys` says whether they already hold the table's point keys.
++void AddTombstoneBounds(const InternalKeyComparator& icmp,
++                        const std::vector<RangeTombstone>& tombstones,
++                        bool have_keys, InternalKey* smallest,
++                        InternalKey* largest);
+ 
+ }  // namespace leveldb
+ 
+diff --git a/db/db_impl.cc b/db/db_impl.cc
+index 1a4e459..517888d 100644
+--- a/db/db_impl.cc
++++ b/db/db_impl.cc
+@@ -13,6 +13,8 @@
+ #include <vector>
+ 
+ #include "db/builder.h"
++#include "db/lookup_state.h"
++#include "db/range_del.h"
+ #include "db/db_iter.h"
+ #include "db/dbformat.h"
+ #include "db/filename.h"
+@@ -24,6 +26,7 @@
+ #include "db/write_batch_internal.h"
+ #include "leveldb/db.h"
+ #include "leveldb/env.h"
++#include "leveldb/merge_operator.h"
+ #include "leveldb/status.h"
+ #include "leveldb/table.h"
+ #include "leveldb/table_builder.h"
+@@ -57,6 +60,7 @@ struct DBImpl::CompactionState {
+     uint64_t number;
+     uint64_t file_size;
+     InternalKey smallest, largest;
++    bool has_range_dels = false;
+   };
+ 
+   Output* current_output() { return &outputs[outputs.size() - 1]; }
+@@ -83,6 +87,14 @@ struct DBImpl::CompactionState {
+   TableBuilder* builder;
+ 
+   uint64_t total_bytes;
++
++  // Range tombstones to carry into the outputs, sorted by begin key.  Each
++  // output file gets the part of them between its cut points.
++  std::vector<RangeTombstone> tombstones;
++  // Where the current output file starts (the previous file's cut); empty
++  // with has_lower_cut false for the first file.
++  std::string lower_cut;
++  bool has_lower_cut = false;
+ };
+ 
+ // Fix user-supplied options to be reasonable
+@@ -513,10 +525,14 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
+   Log(options_.info_log, "Level-0 table #%llu: started",
+       (unsigned long long)meta.number);
+ 
++  std::vector<RangeTombstone> tombstones;
++  mem->GetRangeTombstones(&tombstones);
++
+   Status s;
+   {
+     mutex_.Unlock();
+-    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
++    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
++                   tombstones);
+     mutex_.Lock();
+   }
+ 
+@@ -536,7 +552,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
+       level = base->PickLevelForMemTableOutput(min_user_key, max_user_key);
+     }
+     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
+-                  meta.largest);
++                  meta.largest, meta.has_range_dels);
+   }
+ 
+   CompactionStats stats;
+@@ -735,7 +751,7 @@ void DBImpl::BackgroundCompaction() {
+     FileMetaData* f = c->input(0, 0);
+     c->edit()->RemoveFile(c->level(), f->number);
+     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
+-                       f->largest);
++                       f->largest, f->has_range_dels);
+     status = versions_->LogAndApply(c->edit(), &mutex_);
+     if (!status.ok()) {
+       RecordBackgroundError(status);
+@@ -823,7 +839,8 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
+ }
+ 
+ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
+-                                          Iterator* input) {
++                                          Iterator* input,
++                                          const Slice* upper_cut) {
+   assert(compact != nullptr);
+   assert(compact->outfile != nullptr);
+   assert(compact->builder != nullptr);
+@@ -831,6 +848,37 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
+   const uint64_t output_number = compact->current_output()->number;
+   assert(output_number != 0);
+ 
++  // The tombstones this file carries: those parts of them in
++  // [lower_cut, upper_cut).
++  const Comparator* ucmp = user_comparator();
++  std::vector<RangeTombstone> mine;
++  for (const RangeTombstone& t : compact->tombstones) {
++    Slice b(t.begin), e(t.end);
++    if (compact->has_lower_cut && ucmp->Compare(b, compact->lower_cut) < 0) {
++      b = compact->lower_cut;
++    }
++    if (upper_cut != nullptr && ucmp->Compare(e, *upper_cut) > 0) {
++      e = *upper_cut;
++    }
++    if (ucmp->Compare(b, e) < 0) {
++      mine.emplace_back(b, e, t.seq);
++    }
++  }
++  if (!mine.empty()) {
++    std::string block;
++    EncodeRangeTombstones(mine, &block);
++    compact->builder->SetRangeDeletionBlock(block);
++    CompactionState::Output* out = compact->current_output();
++    AddTombstoneBounds(internal_comparator_, mine,
++                       compact->builder->NumEntries() > 0, &out->smallest,
++                       &out->largest);
++    out->has_range_dels = true;
++  }
++  if (upper_cut != nullptr) {
++    compact->lower_cut = upper_cut->ToString();
++    compact->has_lower_cut = true;
++  }
++
+   // Check for iterator errors
+   Status s = input->status();
+   const uint64_t current_entries = compact->builder->NumEntries();
+@@ -884,7 +932,8 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
+   for (size_t i = 0; i < compact->outputs.size(); i++) {
+     const CompactionState::Output& out = compact->outputs[i];
+     compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
+-                                         out.smallest, out.largest);
++                                         out.smallest, out.largest,
++                                         out.has_range_dels);
+   }
+   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+ }
+@@ -901,6 +950,11 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
+   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
+   assert(compact->builder == nullptr);
+   assert(compact->outfile == nullptr);
++  // Every live snapshot, oldest first.  Entries between two consecutive
++  // snapshots (a "stripe") are seen by the same readers, so within a stripe
++  // only what the newest of them resolves to has to be kept.
++  std::vector<SequenceNumber> snapshots;
++  snapshots_.GetAll(&snapshots);
+   if (snapshots_.empty()) {
+     compact->smallest_snapshot = versions_->LastSequence();
+   } else {
+@@ -912,13 +966,188 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
+   // Release mutex while we're actually doing the compaction work
+   mutex_.Unlock();
+ 
+-  input->SeekToFirst();
++  const Comparator* ucmp = user_comparator();
+   Status status;
++
++  // The range tombstones of the input files.  Those that nothing below the
++  // output level can still need, and that every reader already sees, are
++  // dropped; the rest go to the outputs.
++  std::vector<RangeTombstone> input_tombstones;
++  for (int which = 0; which < 2 && status.ok(); which++) {
++    for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
++      FileMetaData* f = compact->compaction->input(which, i);
++      if (!f->has_range_dels) continue;
++      status = table_cache_->GetRangeTombstones(f->number, f->file_size,
++                                                &input_tombstones);
++      if (!status.ok()) break;
++    }
++  }
++  RangeDelIndex input_rd(ucmp);
++  for (const RangeTombstone& t : input_tombstones) {
++    input_rd.Add(t);
++    if (t.seq <= compact->smallest_snapshot &&
++        compact->compaction->IsBaseLevelForRange(t.begin, t.end)) {
++      continue;
++    }
++    compact->tombstones.push_back(t);
++  }
++  input_rd.Finish();
++  std::sort(compact->tombstones.begin(), compact->tombstones.end(),
++            [ucmp](const RangeTombstone& a, const RangeTombstone& b) {
++              return ucmp->Compare(a.begin, b.begin) < 0;
++            });
++
++  // Stripe of a sequence number: index of the oldest snapshot at or above
++  // it, snapshots.size() for the newest stripe.
++  auto stripe_of = [&snapshots](SequenceNumber seq) -> size_t {
++    return std::lower_bound(snapshots.begin(), snapshots.end(), seq) -
++           snapshots.begin();
++  };
++  const MergeOperator* merge_op = options_.merge_operator;
++
++  struct Entry {
++    SequenceNumber seq;
++    ValueType type;
++    std::string value;
++  };
++  std::string group_key;             // user key of the group being collected
++  std::vector<Entry> group;          // its entries, newest first
++  std::vector<Entry> out;            // what the group compacts to
++  bool pending_cut = false;          // current output is full
++
++  // Writes one internal key to the outputs, opening a file if need be.
++  auto emit = [&](const Slice& ikey, const Slice& value) -> Status {
++    Status st;
++    if (compact->builder == nullptr) {
++      st = OpenCompactionOutputFile(compact);
++      if (!st.ok()) return st;
++    }
++    if (compact->builder->NumEntries() == 0) {
++      compact->current_output()->smallest.DecodeFrom(ikey);
++    }
++    compact->current_output()->largest.DecodeFrom(ikey);
++    compact->builder->Add(ikey, value);
++    return st;
++  };
++
++  // Compacts the collected group into `out` (newest first).
++  auto compact_group = [&]() {
++    out.clear();
++    const Slice user_key(group_key);
++    const bool base_level = compact->compaction->IsBaseLevelForKey(user_key);
++    size_t i = 0;
++    while (i < group.size()) {
++      const size_t stripe = stripe_of(group[i].seq);
++      const SequenceNumber bound =
++          stripe < snapshots.size() ? snapshots[stripe] : kMaxSequenceNumber;
++      const SequenceNumber newest = group[i].seq;
++      std::vector<std::string> ops;  // newest first
++      bool settled = false;
++      const std::string* base = nullptr;
++      size_t j = i;
++      for (; j < group.size() && stripe_of(group[j].seq) == stripe; j++) {
++        Entry& e = group[j];
++        if (e.type != kTypeDeletion && input_rd.Covers(user_key, e.seq, bound)) {
++          // Hidden by a tombstone that every reader of this stripe sees.
++          e.type = kTypeDeletion;
++          e.value.clear();
++        }
++        if (e.type == kTypeMerge) {
++          ops.push_back(e.value);
++          continue;
++        }
++        settled = true;
++        if (e.type == kTypeValue) base = &e.value;
++        break;
++      }
++      const size_t settle = j;  // index of the settling entry, if settled
++      size_t next = j;
++      while (next < group.size() && stripe_of(group[next].seq) == stripe) {
++        next++;  // older entries of the stripe are hidden from everyone
++      }
++      const bool nothing_older = next >= group.size() && base_level;
++      bool done = false;
++      if (settled && ops.empty()) {
++        const Entry& e = group[settle];
++        if (e.type == kTypeDeletion && stripe == 0 && base_level) {
++          // An obsolete deletion marker: nothing older anywhere.
++        } else {
++          out.push_back(e);
++        }
++        done = true;
++      } else if (merge_op != nullptr && (settled || nothing_older)) {
++        std::vector<std::string> oldest_first(ops.rbegin(), ops.rend());
++        std::string merged;
++        Slice base_slice;
++        if (base != nullptr) base_slice = *base;
++        if (merge_op->FullMerge(user_key, base != nullptr ? &base_slice : nullptr,
++                                oldest_first, &merged)) {
++          out.push_back(Entry{newest, kTypeValue, std::move(merged)});
++          done = true;
++        }
++      } else if (merge_op != nullptr && ops.size() > 1) {
++        std::string acc = ops.back();
++        bool ok = true;
++        for (size_t k = ops.size() - 1; k-- > 0;) {
++          std::string tmp;
++          if (!merge_op->PartialMerge(user_key, acc, ops[k], &tmp)) {
++            ok = false;
++            break;
++          }
++          acc.swap(tmp);
++        }
++        if (ok) {
++          out.push_back(Entry{newest, kTypeMerge, std::move(acc)});
++          done = true;
++        }
++      }
++      if (!done) {
++        // Keep the operands as they are, plus what settles them.
++        for (size_t k = i; k < settle && k < group.size(); k++) {
++          out.push_back(group[k]);
++        }
++        if (settled) out.push_back(group[settle]);
++      }
++      i = next;
++    }
++  };
++
++  // Writes the compacted group, starting a new output file first if the
++  // current one is full or should stop before this key.
++  auto flush_group = [&]() -> Status {
++    Status st;
++    if (group.empty()) return st;
++    std::string first_ikey;
++    AppendInternalKey(&first_ikey,
++                      ParsedInternalKey(group_key, group[0].seq, group[0].type));
++    const bool stop = compact->compaction->ShouldStopBefore(first_ikey);
++    compact_group();
++    if (compact->builder != nullptr && (pending_cut || stop)) {
++      Slice cut(group_key);
++      st = FinishCompactionOutputFile(compact, input, &cut);
++      pending_cut = false;
++      if (!st.ok()) return st;
++    }
++    std::string ikey;
++    for (const Entry& e : out) {
++      ikey.clear();
++      AppendInternalKey(&ikey, ParsedInternalKey(group_key, e.seq, e.type));
++      st = emit(ikey, e.value);
++      if (!st.ok()) return st;
++    }
++    if (compact->builder != nullptr &&
++        compact->builder->FileSize() >=
++            compact->compaction->MaxOutputFileSize()) {
++      pending_cut = true;
++    }
++    group.clear();
++    return st;
++  };
++
++  if (status.ok()) input->SeekToFirst();
+   ParsedInternalKey ikey;
+-  std::string current_user_key;
+-  bool has_current_user_key = false;
+-  SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+-  while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
++  while (status.ok() && input->Valid() &&
++         !shutting_down_.load(std::memory_order_acquire)) {
+     // Prioritize immutable compaction work
+     if (has_imm_.load(std::memory_order_relaxed)) {
+       const uint64_t imm_start = env_->NowMicros();
+@@ -933,91 +1162,42 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
+     }
+ 
+     Slice key = input->key();
+-    if (compact->compaction->ShouldStopBefore(key) &&
+-        compact->builder != nullptr) {
+-      status = FinishCompactionOutputFile(compact, input);
+-      if (!status.ok()) {
+-        break;
+-      }
+-    }
+-
+-    // Handle key/value, add to state, etc.
+-    bool drop = false;
+-    if (!ParseInternalKey(key, &ikey)) {
++    if (!ParseInternalKey(key, &ikey) || ikey.type == kTypeRangeDeletion) {
+       // Do not hide error keys
+-      current_user_key.clear();
+-      has_current_user_key = false;
+-      last_sequence_for_key = kMaxSequenceNumber;
++      status = flush_group();
++      if (status.ok()) status = emit(key, input->value());
++      group_key.clear();
+     } else {
+-      if (!has_current_user_key ||
+-          user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
+-              0) {
+-        // First occurrence of this user key
+-        current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
+-        has_current_user_key = true;
+-        last_sequence_for_key = kMaxSequenceNumber;
+-      }
+-
+-      if (last_sequence_for_key <= compact->smallest_snapshot) {
+-        // Hidden by an newer entry for same user key
+-        drop = true;  // (A)
+-      } else if (ikey.type == kTypeDeletion &&
+-                 ikey.sequence <= compact->smallest_snapshot &&
+-                 compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
+-        // For this user key:
+-        // (1) there is no data in higher levels
+-        // (2) data in lower levels will have larger sequence numbers
+-        // (3) data in layers that are being compacted here and have
+-        //     smaller sequence numbers will be dropped in the next
+-        //     few iterations of this loop (by rule (A) above).
+-        // Therefore this deletion marker is obsolete and can be dropped.
+-        drop = true;
+-      }
+-
+-      last_sequence_for_key = ikey.sequence;
+-    }
+-#if 0
+-    Log(options_.info_log,
+-        "  Compact: %s, seq %d, type: %d %d, drop: %d, is_base: %d, "
+-        "%d smallest_snapshot: %d",
+-        ikey.user_key.ToString().c_str(),
+-        (int)ikey.sequence, ikey.type, kTypeValue, drop,
+-        compact->compaction->IsBaseLevelForKey(ikey.user_key),
+-        (int)last_sequence_for_key, (int)compact->smallest_snapshot);
+-#endif
+-
+-    if (!drop) {
+-      // Open output file if necessary
+-      if (compact->builder == nullptr) {
+-        status = OpenCompactionOutputFile(compact);
+-        if (!status.ok()) {
+-          break;
+-        }
++      if (!group.empty() && ucmp->Compare(ikey.user_key, group_key) != 0) {
++        status = flush_group();
+       }
+-      if (compact->builder->NumEntries() == 0) {
+-        compact->current_output()->smallest.DecodeFrom(key);
+-      }
+-      compact->current_output()->largest.DecodeFrom(key);
+-      compact->builder->Add(key, input->value());
+-
+-      // Close output file if it is big enough
+-      if (compact->builder->FileSize() >=
+-          compact->compaction->MaxOutputFileSize()) {
+-        status = FinishCompactionOutputFile(compact, input);
+-        if (!status.ok()) {
+-          break;
+-        }
++      if (group.empty()) {
++        group_key.assign(ikey.user_key.data(), ikey.user_key.size());
+       }
++      group.push_back(Entry{ikey.sequence, ikey.type, input->value().ToString()});
+     }
+-
+     input->Next();
+   }
++  if (status.ok() && !shutting_down_.load(std::memory_order_acquire)) {
++    status = flush_group();
++  }
+ 
+   if (status.ok() && shutting_down_.load(std::memory_order_acquire)) {
+     status = Status::IOError("Deleting DB during compaction");
+   }
++  if (status.ok() && compact->builder == nullptr) {
++    // Tombstones past the last output still need a home.
++    bool left = false;
++    for (const RangeTombstone& t : compact->tombstones) {
++      if (!compact->has_lower_cut || ucmp->Compare(t.end, compact->lower_cut) > 0) {
++        left = true;
++        break;
++      }
++    }
++    if (left) status = OpenCompactionOutputFile(compact);
++  }
+   if (status.ok() && compact->builder != nullptr) {
+-    status = FinishCompactionOutputFile(compact, input);
++    status = FinishCompactionOutputFile(compact, input, nullptr);
+   }
+   if (status.ok()) {
+     status = input->status();
+@@ -1074,11 +1254,51 @@ static void CleanupIteratorState(void* arg1, void* arg2) {
+ 
+ }  // anonymous namespace
+ 
+-Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
+-                                      SequenceNumber* latest_snapshot,
+-                                      uint32_t* seed) {
++std::shared_ptr<const RangeDelView> DBImpl::RangeDelsLocked(MemTable* mem,
++                                                            MemTable* imm,
++                                                            Version* v,
++                                                            Status* s) {
++  mutex_.AssertHeld();
++  RangeDelCache& c = range_del_cache_;
++  if (c.version_id != v->id()) {
++    c.version_id = v->id();
++    c.version_has_range_dels = v->HasRangeDels();
++    c.index.reset();
++    if (c.version_has_range_dels) {
++      std::vector<RangeTombstone> all;
++      *s = v->GetRangeTombstones(&all);
++      if (!s->ok()) {
++        c.version_id = 0;
++        return nullptr;
++      }
++      RangeDelIndex* index = new RangeDelIndex(user_comparator());
++      for (const RangeTombstone& t : all) index->Add(t);
++      index->Finish();
++      c.index.reset(index);
++    }
++  }
++  if (mem->NumRangeTombstones() == 0 &&
++      (imm == nullptr || imm->NumRangeTombstones() == 0) && c.index == nullptr) {
++    return nullptr;
++  }
++  return std::make_shared<const RangeDelView>(mem, imm, c.index);
++}
++
++Iterator* DBImpl::NewInternalIterator(
++    const ReadOptions& options, SequenceNumber* latest_snapshot,
++    uint32_t* seed, std::shared_ptr<const RangeDelView>* range_dels) {
+   mutex_.Lock();
+   *latest_snapshot = versions_->LastSequence();
++  std::shared_ptr<const RangeDelView> view;
++  if (range_dels != nullptr) {
++    Status s;
++    view = RangeDelsLocked(mem_, imm_, versions_->current(), &s);
++    if (!s.ok()) {
++      mutex_.Unlock();
++      return NewErrorIterator(s);
++    }
++    *range_dels = view;
++  }
+ 
+   // Collect together all needed child iterators
+   std::vector<Iterator*> list;
+@@ -1088,7 +1308,26 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
+     list.push_back(imm_->NewIterator());
+     imm_->Ref();
+   }
+-  versions_->current()->AddIterators(options, &list);
++  if (view == nullptr) {
++    versions_->current()->AddIterators(options, &list);
++  } else {
++    // Each older layer skips what a newer layer's tombstone hides.
++    const SequenceNumber snapshot =
++        options.snapshot != nullptr
++            ? static_cast<const SnapshotImpl*>(options.snapshot)
++                  ->sequence_number()
++            : *latest_snapshot;
++    if (imm_ != nullptr) {
++      list.back() = NewRangeDelSkippingIterator(list.back(), &internal_comparator_,
++                                                view, kLayerImm, snapshot);
++    }
++    std::vector<std::pair<Iterator*, int>> layers;
++    versions_->current()->AddLayerIterators(options, &layers);
++    for (auto& p : layers) {
++      list.push_back(NewRangeDelSkippingIterator(p.first, &internal_comparator_,
++                                                 view, p.second, snapshot));
++    }
++  }
+   Iterator* internal_iter =
+       NewMergingIterator(&internal_comparator_, &list[0], list.size());
+   versions_->current()->Ref();
+@@ -1133,20 +1372,37 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
+ 
+   bool have_stat_update = false;
+   Version::GetStats stats;
++  std::shared_ptr<const RangeDelView> range_dels =
++      RangeDelsLocked(mem, imm, current, &s);
+ 
+   // Unlock while reading from files and memtables
+-  {
++  if (s.ok()) {
+     mutex_.Unlock();
+     // First look in the memtable, then in the immutable memtable (if any).
+     LookupKey lkey(key, snapshot);
+-    if (mem->Get(lkey, value, &s)) {
++    LookupState lookup(key, snapshot, options_.merge_operator,
++                       range_dels.get(), value);
++    // A tombstone of a newer layer hides everything below it.
++    auto hidden_below = [&](int layer) {
++      if (range_dels != nullptr &&
++          range_dels->MaxCovering(key, snapshot, layer) > 0) {
++        lookup.SettleDeleted();
++        return true;
++      }
++      return false;
++    };
++    if (mem->Get(lkey, &lookup)) {
+       // Done
+-    } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
++    } else if (imm != nullptr &&
++               (hidden_below(kLayerImm) || imm->Get(lkey, &lookup))) {
++      // Done
++    } else if (hidden_below(kFirstTableLayer)) {
+       // Done
+     } else {
+-      s = current->Get(options, lkey, value, &stats);
++      s = current->Get(options, lkey, &lookup, &stats, range_dels.get());
+       have_stat_update = true;
+     }
++    if (s.ok()) s = lookup.Finish();
+     mutex_.Lock();
+   }
+ 
+@@ -1162,13 +1418,15 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
+ Iterator* DBImpl::NewIterator(const ReadOptions& options) {
+   SequenceNumber latest_snapshot;
+   uint32_t seed;
+-  Iterator* iter = NewInternalIterator(options, &latest_snapshot, &seed);
++  std::shared_ptr<const RangeDelView> range_dels;
++  Iterator* iter =
++      NewInternalIterator(options, &latest_snapshot, &seed, &range_dels);
+   return NewDBIterator(this, user_comparator(), iter,
+                        (options.snapshot != nullptr
+                             ? static_cast<const SnapshotImpl*>(options.snapshot)
+                                   ->sequence_number()
+                             : latest_snapshot),
+-                       seed);
++                       seed, options_.merge_operator, std::move(range_dels));
+ }
+ 
+ void DBImpl::RecordReadSample(Slice key) {
+@@ -1197,7 +1455,24 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
+   return DB::Delete(options, key);
+ }
+ 
++Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin,
++                           const Slice& end) {
++  return DB::DeleteRange(options, begin, end);
++}
++
++Status DBImpl::Merge(const WriteOptions& options, const Slice& key,
++                     const Slice& value) {
++  if (options_.merge_operator == nullptr) {
++    return Status::InvalidArgument("no merge_operator configured");
++  }
++  return DB::Merge(options, key, value);
++}
++
+ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
++  if (updates != nullptr && options_.merge_operator == nullptr &&
++      WriteBatchInternal::HasMerge(updates)) {
++    return Status::InvalidArgument("no merge_operator configured");
++  }
+   Writer w(&mutex_);
+   w.batch = updates;
+   w.sync = options.sync;
+@@ -1478,6 +1753,20 @@ Status DB::Delete(const WriteOptions& opt, const Slice& key) {
+   return Write(opt, &batch);
+ }
+ 
++Status DB::DeleteRange(const WriteOptions& opt, const Slice& begin,
++                       const Slice& end) {
++  WriteBatch batch;
++  batch.DeleteRange(begin, end);
++  return Write(opt, &batch);
++}
++
++Status DB::Merge(const WriteOptions& opt, const Slice& key,
++                 const Slice& value) {
++  WriteBatch batch;
++  batch.Merge(key, value);
++  return Write(opt, &batch);
++}
++
+ DB::~DB() = default;
+ 
+ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
+diff --git a/db/db_impl.h b/db/db_impl.h
+index c7b0172..465b87c 100644
+--- a/db/db_impl.h
++++ b/db/db_impl.h
+@@ -7,10 +7,12 @@
+ 
+ #include <atomic>
+ #include <deque>
++#include <memory>
+ #include <set>
+ #include <string>
+ 
+ #include "db/dbformat.h"
++#include "db/range_del_view.h"
+ #include "db/log_writer.h"
+ #include "db/snapshot.h"
+ #include "leveldb/db.h"
+@@ -39,6 +41,10 @@ class DBImpl : public DB {
+   Status Put(const WriteOptions&, const Slice& key,
+              const Slice& value) override;
+   Status Delete(const WriteOptions&, const Slice& key) override;
++  Status DeleteRange(const WriteOptions&, const Slice& begin,
++                     const Slice& end) override;
++  Status Merge(const WriteOptions&, const Slice& key,
++               const Slice& value) override;
+   Status Write(const WriteOptions& options, WriteBatch* updates) override;
+   Status Get(const ReadOptions& options, const Slice& key,
+              std::string* value) override;
+@@ -101,9 +107,20 @@ class DBImpl : public DB {
+     int64_t bytes_written;
+   };
+ 
+-  Iterator* NewInternalIterator(const ReadOptions&,
+-                                SequenceNumber* latest_snapshot,
+-                                uint32_t* seed);
++  // Also returns, in *range_dels, a view of every range tombstone the
++  // iterator may meet (nullptr if there is none); the iterators of older
++  // layers then skip what newer layers' tombstones hide.
++  Iterator* NewInternalIterator(
++      const ReadOptions&, SequenceNumber* latest_snapshot, uint32_t* seed,
++      std::shared_ptr<const RangeDelView>* range_dels = nullptr);
++
++  // A view of the range tombstones of mem, imm and v, nullptr if they hold
++  // none.  The memtables answer from their own fragment maps; the tables'
++  // tombstones are indexed once per version.
++  std::shared_ptr<const RangeDelView> RangeDelsLocked(MemTable* mem,
++                                                      MemTable* imm,
++                                                      Version* v, Status* s)
++      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+   Status NewDB();
+ 
+@@ -147,7 +164,11 @@ class DBImpl : public DB {
+       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+   Status OpenCompactionOutputFile(CompactionState* compact);
+-  Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input);
++  // Finishes the current output.  `upper_cut` is the first user key of the
++  // next output (nullptr for the last one); the file gets the parts of the
++  // compaction's range tombstones below it.
++  Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input,
++                                    const Slice* upper_cut);
+   Status InstallCompactionResults(CompactionState* compact)
+       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+@@ -203,6 +224,13 @@ class DBImpl : public DB {
+   Status bg_error_ GUARDED_BY(mutex_);
+ 
+   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
++
++  struct RangeDelCache {
++    uint64_t version_id = 0;
++    bool version_has_range_dels = false;
++    std::shared_ptr<const RangeDelIndex> index;  // the version's tables
++  };
++  RangeDelCache range_del_cache_ GUARDED_BY(mutex_);
+ };
+ 
+ // Sanitize db options.  The caller should delete result.info_log if
+diff --git a/db/db_iter.cc b/db/db_iter.cc
+index 532c2db..018928b 100644
+--- a/db/db_iter.cc
++++ b/db/db_iter.cc
+@@ -7,6 +7,8 @@
+ #include "db/db_impl.h"
+ #include "db/dbformat.h"
+ #include "db/filename.h"
++#include "db/range_del_view.h"
++#include "leveldb/merge_operator.h"
+ #include "leveldb/env.h"
+ #include "leveldb/iterator.h"
+ #include "port/port.h"
+@@ -41,18 +43,26 @@ class DBIter : public Iterator {
+   // Which direction is the iterator currently moving?
+   // (1) When moving forward, the internal iterator is positioned at
+   //     the exact entry that yields this->key(), this->value()
++  //     Except when that entry is a merge operand: then the operands
++  //     have been folded into saved_value_ (merged_ is set, the key is in
++  //     merged_key_) and the internal iterator is past all entries of the
++  //     key.
+   // (2) When moving backwards, the internal iterator is positioned
+   //     just before all entries whose user key == this->key().
+   enum Direction { kForward, kReverse };
+ 
+   DBIter(DBImpl* db, const Comparator* cmp, Iterator* iter, SequenceNumber s,
+-         uint32_t seed)
++         uint32_t seed, const MergeOperator* merge_op,
++         std::shared_ptr<const RangeDelView> range_dels)
+       : db_(db),
+         user_comparator_(cmp),
+         iter_(iter),
+         sequence_(s),
++        merge_op_(merge_op),
++        range_dels_(std::move(range_dels)),
+         direction_(kForward),
+         valid_(false),
++        merged_(false),
+         rnd_(seed),
+         bytes_until_read_sampling_(RandomCompactionPeriod()) {}
+ 
+@@ -63,11 +73,15 @@ class DBIter : public Iterator {
+   bool Valid() const override { return valid_; }
+   Slice key() const override {
+     assert(valid_);
+-    return (direction_ == kForward) ? ExtractUserKey(iter_->key()) : saved_key_;
++    if (direction_ == kForward) {
++      return merged_ ? Slice(merged_key_) : ExtractUserKey(iter_->key());
++    }
++    return saved_key_;
+   }
+   Slice value() const override {
+     assert(valid_);
+-    return (direction_ == kForward) ? iter_->value() : saved_value_;
++    if (direction_ == kForward && !merged_) return iter_->value();
++    return saved_value_;
+   }
+   Status status() const override {
+     if (status_.ok()) {
+@@ -87,6 +101,19 @@ class DBIter : public Iterator {
+   void FindNextUserEntry(bool skipping, std::string* skip);
+   void FindPrevUserEntry();
+   bool ParseKey(ParsedInternalKey* key);
++  void MergeForward(const Slice& user_key);
++  bool FullMerge(const std::string* base,
++                 const std::vector<std::string>& operands_oldest_first);
++
++  // The entry's type as this iterator sees it: covered by a range
++  // tombstone it is a deletion.
++  ValueType EffectiveType(const ParsedInternalKey& ikey) const {
++    if (ikey.type != kTypeDeletion && range_dels_ != nullptr &&
++        range_dels_->Covers(ikey.user_key, ikey.sequence, sequence_)) {
++      return kTypeDeletion;
++    }
++    return ikey.type;
++  }
+ 
+   inline void SaveKey(const Slice& k, std::string* dst) {
+     dst->assign(k.data(), k.size());
+@@ -110,11 +137,16 @@ class DBIter : public Iterator {
+   const Comparator* const user_comparator_;
+   Iterator* const iter_;
+   SequenceNumber const sequence_;
++  const MergeOperator* const merge_op_;
++  const std::shared_ptr<const RangeDelView> range_dels_;
+   Status status_;
+   std::string saved_key_;    // == current key when direction_==kReverse
+-  std::string saved_value_;  // == current raw value when direction_==kReverse
++  std::string saved_value_;  // == current value when direction_==kReverse
++                             //    or merged_
++  std::string merged_key_;   // == current key when merged_
+   Direction direction_;
+   bool valid_;
++  bool merged_;
+   Random rnd_;
+   size_t bytes_until_read_sampling_;
+ };
+@@ -157,6 +189,16 @@ void DBIter::Next() {
+       return;
+     }
+     // saved_key_ already contains the key to skip past.
++  } else if (merged_) {
++    // iter_ is already past the entries of the current key.
++    merged_ = false;
++    SaveKey(merged_key_, &saved_key_);
++    ClearSavedValue();
++    if (!iter_->Valid()) {
++      valid_ = false;
++      saved_key_.clear();
++      return;
++    }
+   } else {
+     // Store in saved_key_ the current key so we skip it below.
+     SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
+@@ -181,7 +223,7 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
+   do {
+     ParsedInternalKey ikey;
+     if (ParseKey(&ikey) && ikey.sequence <= sequence_) {
+-      switch (ikey.type) {
++      switch (EffectiveType(ikey)) {
+         case kTypeDeletion:
+           // Arrange to skip all upcoming entries for this key since
+           // they are hidden by this deletion.
+@@ -189,15 +231,22 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
+           skipping = true;
+           break;
+         case kTypeValue:
++        case kTypeMerge:
+           if (skipping &&
+               user_comparator_->Compare(ikey.user_key, *skip) <= 0) {
+             // Entry hidden
++          } else if (ikey.type == kTypeMerge) {
++            saved_key_.clear();
++            MergeForward(ikey.user_key);
++            return;
+           } else {
+             valid_ = true;
+             saved_key_.clear();
+             return;
+           }
+           break;
++        default:
++          break;
+       }
+     }
+     iter_->Next();
+@@ -206,26 +255,85 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
+   valid_ = false;
+ }
+ 
++void DBIter::MergeForward(const Slice& user_key) {
++  // iter_ is at the newest visible entry of the key, a merge operand.
++  merged_key_.assign(user_key.data(), user_key.size());
++  std::vector<std::string> operands;  // newest first
++  operands.push_back(iter_->value().ToString());
++  std::string base;
++  bool has_base = false;
++  bool settled = false;
++  iter_->Next();
++  while (iter_->Valid()) {
++    ParsedInternalKey ikey;
++    if (!ParseKey(&ikey)) break;
++    if (user_comparator_->Compare(ikey.user_key, merged_key_) != 0) break;
++    if (!settled) {
++      switch (EffectiveType(ikey)) {
++        case kTypeMerge:
++          operands.push_back(iter_->value().ToString());
++          break;
++        case kTypeValue:
++          base = iter_->value().ToString();
++          has_base = true;
++          settled = true;
++          break;
++        default:
++          settled = true;
++          break;
++      }
++    }
++    iter_->Next();
++  }
++  std::vector<std::string> oldest_first(operands.rbegin(), operands.rend());
++  merged_ = true;
++  valid_ = FullMerge(has_base ? &base : nullptr, oldest_first);
++}
++
++bool DBIter::FullMerge(const std::string* base,
++                       const std::vector<std::string>& operands) {
++  const Slice key = direction_ == kForward ? Slice(merged_key_) : saved_key_;
++  if (merge_op_ == nullptr) {
++    status_ = Status::InvalidArgument("merge operand but no merge_operator");
++    return false;
++  }
++  Slice base_slice;
++  if (base != nullptr) base_slice = *base;
++  std::string result;
++  if (!merge_op_->FullMerge(key, base != nullptr ? &base_slice : nullptr,
++                            operands, &result)) {
++    status_ = Status::Corruption("merge operator failed");
++    return false;
++  }
++  saved_value_.swap(result);
++  return true;
++}
++
+ void DBIter::Prev() {
+   assert(valid_);
+ 
+   if (direction_ == kForward) {  // Switch directions?
+-    // iter_ is pointing at the current entry.  Scan backwards until
+-    // the key changes so we can use the normal reverse scanning code.
+-    assert(iter_->Valid());  // Otherwise valid_ would have been false
+-    SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
+-    while (true) {
++    // iter_ is pointing at the current entry (or, after a merge, past the
++    // entries of the current key).  Scan backwards until the key changes so
++    // we can use the normal reverse scanning code.
++    if (merged_) {
++      merged_ = false;
++      SaveKey(merged_key_, &saved_key_);
++      if (!iter_->Valid()) iter_->SeekToLast();
++    } else {
++      assert(iter_->Valid());  // Otherwise valid_ would have been false
++      SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
++    }
++    while (iter_->Valid() &&
++           user_comparator_->Compare(ExtractUserKey(iter_->key()),
++                                     saved_key_) >= 0) {
+       iter_->Prev();
+-      if (!iter_->Valid()) {
+-        valid_ = false;
+-        saved_key_.clear();
+-        ClearSavedValue();
+-        return;
+-      }
+-      if (user_comparator_->Compare(ExtractUserKey(iter_->key()), saved_key_) <
+-          0) {
+-        break;
+-      }
++    }
++    if (!iter_->Valid()) {
++      valid_ = false;
++      saved_key_.clear();
++      ClearSavedValue();
++      return;
+     }
+     direction_ = kReverse;
+   }
+@@ -236,7 +344,14 @@ void DBIter::Prev() {
+ void DBIter::FindPrevUserEntry() {
+   assert(direction_ == kReverse);
+ 
++  // Entries of a key come oldest first here.  value_type is what the
++  // newest entry seen so far for saved_key_ makes of it: a deletion (no
++  // value), a value (saved_value_), or merge operands on top of whatever
++  // was there (has_base says whether that was saved_value_).
+   ValueType value_type = kTypeDeletion;
++  bool has_base = false;
++  std::vector<std::string> operands;  // oldest first
++  merged_ = false;
+   if (iter_->Valid()) {
+     do {
+       ParsedInternalKey ikey;
+@@ -246,18 +361,39 @@ void DBIter::FindPrevUserEntry() {
+           // We encountered a non-deleted value in entries for previous keys,
+           break;
+         }
+-        value_type = ikey.type;
+-        if (value_type == kTypeDeletion) {
+-          saved_key_.clear();
+-          ClearSavedValue();
+-        } else {
+-          Slice raw_value = iter_->value();
+-          if (saved_value_.capacity() > raw_value.size() + 1048576) {
+-            std::string empty;
+-            swap(empty, saved_value_);
++        switch (EffectiveType(ikey)) {
++          case kTypeDeletion:
++            value_type = kTypeDeletion;
++            saved_key_.clear();
++            ClearSavedValue();
++            operands.clear();
++            has_base = false;
++            break;
++          case kTypeValue: {
++            value_type = kTypeValue;
++            Slice raw_value = iter_->value();
++            if (saved_value_.capacity() > raw_value.size() + 1048576) {
++              std::string empty;
++              swap(empty, saved_value_);
++            }
++            SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
++            saved_value_.assign(raw_value.data(), raw_value.size());
++            operands.clear();
++            has_base = true;
++            break;
+           }
+-          SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
+-          saved_value_.assign(raw_value.data(), raw_value.size());
++          case kTypeMerge:
++            if (value_type == kTypeDeletion) {
++              SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
++              ClearSavedValue();
++              has_base = false;
++              operands.clear();
++            }
++            value_type = kTypeMerge;
++            operands.push_back(iter_->value().ToString());
++            break;
++          default:
++            break;
+         }
+       }
+       iter_->Prev();
+@@ -270,6 +406,10 @@ void DBIter::FindPrevUserEntry() {
+     saved_key_.clear();
+     ClearSavedValue();
+     direction_ = kForward;
++  } else if (!operands.empty()) {
++    std::string base;
++    if (has_base) base.swap(saved_value_);
++    valid_ = FullMerge(has_base ? &base : nullptr, operands);
+   } else {
+     valid_ = true;
+   }
+@@ -277,6 +417,7 @@ void DBIter::FindPrevUserEntry() {
+ 
+ void DBIter::Seek(const Slice& target) {
+   direction_ = kForward;
++  merged_ = false;
+   ClearSavedValue();
+   saved_key_.clear();
+   AppendInternalKey(&saved_key_,
+@@ -291,6 +432,7 @@ void DBIter::Seek(const Slice& target) {
+ 
+ void DBIter::SeekToFirst() {
+   direction_ = kForward;
++  merged_ = false;
+   ClearSavedValue();
+   iter_->SeekToFirst();
+   if (iter_->Valid()) {
+@@ -302,6 +444,7 @@ void DBIter::SeekToFirst() {
+ 
+ void DBIter::SeekToLast() {
+   direction_ = kReverse;
++  merged_ = false;
+   ClearSavedValue();
+   iter_->SeekToLast();
+   FindPrevUserEntry();
+@@ -311,8 +454,10 @@ void DBIter::SeekToLast() {
+ 
+ Iterator* NewDBIterator(DBImpl* db, const Comparator* user_key_comparator,
+                         Iterator* internal_iter, SequenceNumber sequence,
+-                        uint32_t seed) {
+-  return new DBIter(db, user_key_comparator, internal_iter, sequence, seed);
++                        uint32_t seed, const MergeOperator* merge_op,
++                        std::shared_ptr<const RangeDelView> range_dels) {
++  return new DBIter(db, user_key_comparator, internal_iter, sequence, seed,
++                    merge_op, std::move(range_dels));
+ }
+ 
+ }  // namespace leveldb
+diff --git a/db/db_iter.h b/db/db_iter.h
+index 5977fc8..0722aed 100644
+--- a/db/db_iter.h
++++ b/db/db_iter.h
+@@ -6,6 +6,7 @@
+ #define STORAGE_LEVELDB_DB_DB_ITER_H_
+ 
+ #include <cstdint>
++#include <memory>
+ 
+ #include "db/dbformat.h"
+ #include "leveldb/db.h"
+@@ -13,13 +14,17 @@
+ namespace leveldb {
+ 
+ class DBImpl;
++class MergeOperator;
++class RangeDelView;
+ 
+ // Return a new iterator that converts internal keys (yielded by
+ // "*internal_iter") that were live at the specified "sequence" number
+-// into appropriate user keys.
++// into appropriate user keys.  Merge operands are folded with merge_op;
++// entries covered by a tombstone in range_dels (may be null) are hidden.
+ Iterator* NewDBIterator(DBImpl* db, const Comparator* user_key_comparator,
+                         Iterator* internal_iter, SequenceNumber sequence,
+-                        uint32_t seed);
++                        uint32_t seed, const MergeOperator* merge_op,
++                        std::shared_ptr<const RangeDelView> range_dels);
+ 
+ }  // namespace leveldb
+ 
+diff --git a/db/dbformat.h b/db/dbformat.h
+index a1c30ed..03100a4 100644
+--- a/db/dbformat.h
++++ b/db/dbformat.h
+@@ -51,14 +51,24 @@ class InternalKey;
+ // Value types encoded as the last component of internal keys.
+ // DO NOT CHANGE THESE ENUM VALUES: they are embedded in the on-disk
+ // data structures.
+-enum ValueType { kTypeDeletion = 0x0, kTypeValue = 0x1 };
++//
++// kTypeMerge entries are merge operands.  kTypeRangeDeletion never appears
++// in a table's or memtable's main key stream: range tombstones are kept on
++// the side (a memtable's range-deletion table, a table's range-deletion
++// block), keyed by their begin key with the end key as the value.
++enum ValueType {
++  kTypeDeletion = 0x0,
++  kTypeValue = 0x1,
++  kTypeMerge = 0x2,
++  kTypeRangeDeletion = 0x3
++};
+ // kValueTypeForSeek defines the ValueType that should be passed when
+ // constructing a ParsedInternalKey object for seeking to a particular
+ // sequence number (since we sort sequence numbers in decreasing order
+ // and the value type is embedded as the low 8 bits in the sequence
+ // number in internal keys, we need to use the highest-numbered
+ // ValueType, not the lowest).
+-static const ValueType kValueTypeForSeek = kTypeValue;
++static const ValueType kValueTypeForSeek = kTypeRangeDeletion;
+ 
+ typedef uint64_t SequenceNumber;
+ 
+@@ -177,7 +187,7 @@ inline bool ParseInternalKey(const Slice& internal_key,
+   result->sequence = num >> 8;
+   result->type = static_cast<ValueType>(c);
+   result->user_key = Slice(internal_key.data(), n - 8);
+-  return (c <= static_cast<uint8_t>(kTypeValue));
++  return (c <= static_cast<uint8_t>(kTypeRangeDeletion));
+ }
+ 
+ // A helper class useful for DBImpl::Get()
+diff --git a/db/lookup_state.h b/db/lookup_state.h
+new file mode 100644
+index 0000000..2fb44f8
+--- /dev/null
++++ b/db/lookup_state.h
+@@ -0,0 +1,115 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++//
++// The state of a point lookup as it walks down the memtables and levels:
++// entries of the key are fed newest first until one of them settles the
++// value (a put, a deletion, or an entry hidden by a range tombstone), with
++// merge operands collected on the way.
++
++#ifndef STORAGE_LEVELDB_DB_LOOKUP_STATE_H_
++#define STORAGE_LEVELDB_DB_LOOKUP_STATE_H_
++
++#include <string>
++#include <vector>
++
++#include "db/dbformat.h"
++#include "db/range_del_view.h"
++#include "leveldb/merge_operator.h"
++#include "leveldb/status.h"
++
++namespace leveldb {
++
++class LookupState {
++ public:
++  // `rd` may be null (no range tombstones anywhere).
++  LookupState(const Slice& user_key, SequenceNumber snapshot,
++              const MergeOperator* merge_op, const RangeDelView* rd,
++              std::string* value)
++      : user_key_(user_key),
++        snapshot_(snapshot),
++        merge_op_(merge_op),
++        rd_(rd),
++        value_(value) {}
++
++  const Slice& user_key() const { return user_key_; }
++  SequenceNumber snapshot() const { return snapshot_; }
++
++  // Feed the next (older) entry of the key; its sequence number must be at
++  // most the snapshot.  Returns true once the lookup is settled.
++  bool Add(ValueType type, SequenceNumber seq, const Slice& value) {
++    if (done_) return true;
++    if (type != kTypeDeletion && rd_ != nullptr &&
++        rd_->Covers(user_key_, seq, snapshot_)) {
++      type = kTypeDeletion;
++    }
++    switch (type) {
++      case kTypeValue:
++        Settle(&value);
++        return true;
++      case kTypeDeletion:
++        Settle(nullptr);
++        return true;
++      case kTypeMerge:
++        operands_.push_back(value.ToString());
++        return false;
++      default:
++        status_ = Status::Corruption("unexpected entry type in lookup");
++        done_ = true;
++        return true;
++    }
++  }
++
++  bool done() const { return done_; }
++
++  // Everything older than what was fed so far is hidden (by a tombstone of
++  // a newer layer): settle as if a deletion came next.
++  void SettleDeleted() {
++    if (!done_) Settle(nullptr);
++  }
++  bool has_operands() const { return !operands_.empty(); }
++
++  // Called once nothing older is left: settles pending operands on an
++  // absent value.  OK (value stored), NotFound, or an error.
++  Status Finish() {
++    if (!done_) Settle(nullptr);
++    return status_;
++  }
++
++ private:
++  void Settle(const Slice* base) {
++    done_ = true;
++    if (operands_.empty()) {
++      if (base == nullptr) {
++        status_ = Status::NotFound(Slice());
++      } else {
++        value_->assign(base->data(), base->size());
++        status_ = Status::OK();
++      }
++      return;
++    }
++    if (merge_op_ == nullptr) {
++      status_ = Status::InvalidArgument("merge operand but no merge_operator");
++      return;
++    }
++    std::vector<std::string> ops(operands_.rbegin(), operands_.rend());
++    if (merge_op_->FullMerge(user_key_, base, ops, value_)) {
++      status_ = Status::OK();
++    } else {
++      status_ = Status::Corruption("merge operator failed");
++    }
++  }
++
++  Slice user_key_;
++  SequenceNumber snapshot_;
++  const MergeOperator* merge_op_;
++  const RangeDelView* rd_;
++  std::string* value_;
++  std::vector<std::string> operands_;  // newest first
++  bool done_ = false;
++  Status status_;
++};
++
++}  // namespace leveldb
++
++#endif  // STORAGE_LEVELDB_DB_LOOKUP_STATE_H_
+diff --git a/db/memtable.cc b/db/memtable.cc
+index f42774d..6b64621 100644
+--- a/db/memtable.cc
++++ b/db/memtable.cc
+@@ -4,10 +4,13 @@
+ 
+ #include "db/memtable.h"
+ #include "db/dbformat.h"
++#include "db/lookup_state.h"
++#include "db/range_del.h"
+ #include "leveldb/comparator.h"
+ #include "leveldb/env.h"
+ #include "leveldb/iterator.h"
+ #include "util/coding.h"
++#include "util/mutexlock.h"
+ 
+ namespace leveldb {
+ 
+@@ -19,7 +22,15 @@ static Slice GetLengthPrefixedSlice(const char* data) {
+ }
+ 
+ MemTable::MemTable(const InternalKeyComparator& comparator)
+-    : comparator_(comparator), refs_(0), table_(comparator_, &arena_) {}
++    : comparator_(comparator),
++      refs_(0),
++      table_(comparator_, &arena_),
++      range_del_map_(comparator.user_comparator()),
++      num_range_dels_(0),
++      id_([] {
++        static std::atomic<uint64_t> next{0};
++        return ++next;
++      }()) {}
+ 
+ MemTable::~MemTable() { assert(refs_ == 0); }
+ 
+@@ -80,6 +91,19 @@ void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key,
+   //  key bytes    : char[internal_key.size()]
+   //  value_size   : varint32 of value.size()
+   //  value bytes  : char[value.size()]
++  if (type == kTypeRangeDeletion) {
++    if (comparator_.comparator.user_comparator()->Compare(key, value) >= 0) {
++      return;  // empty range
++    }
++    // Kept in insertion order, outside the arena (charged to it for the
++    // memory estimate).
++    arena_.Allocate(key.size() + value.size() + 16);
++    MutexLock l(&range_dels_mu_);
++    range_dels_.emplace_back(key, value, s);
++    range_del_map_.Add(key, value, s);
++    num_range_dels_.fetch_add(1, std::memory_order_release);
++    return;
++  }
+   size_t key_size = key.size();
+   size_t val_size = value.size();
+   size_t internal_key_size = key_size + 8;
+@@ -98,37 +122,49 @@ void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key,
+   table_.Insert(buf);
+ }
+ 
+-bool MemTable::Get(const LookupKey& key, std::string* value, Status* s) {
++SequenceNumber MemTable::MaxCoveringRangeDel(const Slice& user_key,
++                                            SequenceNumber snapshot) {
++  MutexLock l(&range_dels_mu_);
++  return range_del_map_.MaxCovering(user_key, snapshot);
++}
++
++bool MemTable::CoveredRangeDel(const Slice& user_key, SequenceNumber snapshot,
++                               std::string* begin, std::string* end) {
++  MutexLock l(&range_dels_mu_);
++  return range_del_map_.CoveredRange(user_key, snapshot, begin, end);
++}
++
++void MemTable::GetRangeTombstones(std::vector<RangeTombstone>* out,
++                                  size_t from, int layer) {
++  MutexLock l(&range_dels_mu_);
++  for (size_t i = from; i < range_dels_.size(); i++) {
++    out->push_back(range_dels_[i]);
++    out->back().layer = layer;
++  }
++}
++
++bool MemTable::Get(const LookupKey& key, LookupState* state) {
+   Slice memkey = key.memtable_key();
+   Table::Iterator iter(&table_);
+-  iter.Seek(memkey.data());
+-  if (iter.Valid()) {
++  const Comparator* ucmp = comparator_.comparator.user_comparator();
++  // Seek() skips every entry with a sequence number above the lookup's.
++  for (iter.Seek(memkey.data()); iter.Valid(); iter.Next()) {
+     // entry format is:
+     //    klength  varint32
+     //    userkey  char[klength]
+     //    tag      uint64
+     //    vlength  varint32
+     //    value    char[vlength]
+-    // Check that it belongs to same user key.  We do not check the
+-    // sequence number since the Seek() call above should have skipped
+-    // all entries with overly large sequence numbers.
+     const char* entry = iter.key();
+     uint32_t key_length;
+     const char* key_ptr = GetVarint32Ptr(entry, entry + 5, &key_length);
+-    if (comparator_.comparator.user_comparator()->Compare(
+-            Slice(key_ptr, key_length - 8), key.user_key()) == 0) {
+-      // Correct user key
+-      const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);
+-      switch (static_cast<ValueType>(tag & 0xff)) {
+-        case kTypeValue: {
+-          Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
+-          value->assign(v.data(), v.size());
+-          return true;
+-        }
+-        case kTypeDeletion:
+-          *s = Status::NotFound(Slice());
+-          return true;
+-      }
++    if (ucmp->Compare(Slice(key_ptr, key_length - 8), key.user_key()) != 0) {
++      break;
++    }
++    const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);
++    Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
++    if (state->Add(static_cast<ValueType>(tag & 0xff), tag >> 8, v)) {
++      return true;
+     }
+   }
+   return false;
+diff --git a/db/memtable.h b/db/memtable.h
+index 9d986b1..86e00f9 100644
+--- a/db/memtable.h
++++ b/db/memtable.h
+@@ -6,16 +6,24 @@
+ #define STORAGE_LEVELDB_DB_MEMTABLE_H_
+ 
+ #include <string>
++#include <vector>
+ 
+ #include "db/dbformat.h"
+ #include "db/skiplist.h"
+ #include "leveldb/db.h"
++#include "db/range_del.h"
++#include "port/port.h"
++#include "port/thread_annotations.h"
+ #include "util/arena.h"
+ 
++#include <atomic>
++
+ namespace leveldb {
+ 
+ class InternalKeyComparator;
++class LookupState;
+ class MemTableIterator;
++struct RangeTombstone;
+ 
+ class MemTable {
+  public:
+@@ -52,15 +60,35 @@ class MemTable {
+ 
+   // Add an entry into memtable that maps key to value at the
+   // specified sequence number and with the specified type.
+-  // Typically value will be empty if type==kTypeDeletion.
++  // Typically value will be empty if type==kTypeDeletion.  For
++  // kTypeRangeDeletion, key is the begin and value the end of the range;
++  // it goes to the range-deletion table (empty ranges are dropped).
+   void Add(SequenceNumber seq, ValueType type, const Slice& key,
+            const Slice& value);
+ 
+-  // If memtable contains a value for key, store it in *value and return true.
+-  // If memtable contains a deletion for key, store a NotFound() error
+-  // in *status and return true.
+-  // Else, return false.
+-  bool Get(const LookupKey& key, std::string* value, Status* s);
++  // Feed the entries of key.user_key() visible at key's sequence number,
++  // newest first, to *state.  Returns true once the lookup is settled.
++  bool Get(const LookupKey& key, LookupState* state);
++
++  // Unique for the life of the process.
++  uint64_t id() const { return id_; }
++
++  // Number of range tombstones added so far.  Safe to call while the
++  // memtable is being modified.
++  size_t NumRangeTombstones() const {
++    return num_range_dels_.load(std::memory_order_acquire);
++  }
++
++  // Appends the range tombstones, in the order they were added, from the
++  // `from`-th on, to *out (with layer `layer`).
++  void GetRangeTombstones(std::vector<RangeTombstone>* out, size_t from = 0,
++                          int layer = 0);
++
++  // Range tombstone lookups (see RangeDelMap).
++  SequenceNumber MaxCoveringRangeDel(const Slice& user_key,
++                                     SequenceNumber snapshot);
++  bool CoveredRangeDel(const Slice& user_key, SequenceNumber snapshot,
++                       std::string* begin, std::string* end);
+ 
+  private:
+   friend class MemTableIterator;
+@@ -80,6 +108,11 @@ class MemTable {
+   int refs_;
+   Arena arena_;
+   Table table_;
++  port::Mutex range_dels_mu_;
++  std::vector<RangeTombstone> range_dels_ GUARDED_BY(range_dels_mu_);
++  RangeDelMap range_del_map_ GUARDED_BY(range_dels_mu_);
++  std::atomic<size_t> num_range_dels_;
++  const uint64_t id_;
+ };
+ 
+ }  // namespace leveldb
+diff --git a/db/range_del.cc b/db/range_del.cc
+new file mode 100644
+index 0000000..e0d454c
+--- /dev/null
++++ b/db/range_del.cc
+@@ -0,0 +1,317 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++
++#include "db/range_del.h"
++
++#include <algorithm>
++
++#include "db/range_del_view.h"
++#include "leveldb/iterator.h"
++#include "util/coding.h"
++
++namespace leveldb {
++
++void EncodeRangeTombstones(const std::vector<RangeTombstone>& t,
++                           std::string* dst) {
++  PutVarint32(dst, static_cast<uint32_t>(t.size()));
++  for (const RangeTombstone& r : t) {
++    PutLengthPrefixedSlice(dst, r.begin);
++    PutLengthPrefixedSlice(dst, r.end);
++    PutVarint64(dst, r.seq);
++  }
++}
++
++Status DecodeRangeTombstones(const Slice& src, std::vector<RangeTombstone>* t) {
++  Slice in = src;
++  uint32_t n;
++  if (!GetVarint32(&in, &n)) {
++    return Status::Corruption("bad range-deletion block");
++  }
++  t->reserve(t->size() + n);
++  for (uint32_t i = 0; i < n; i++) {
++    Slice b, e;
++    uint64_t seq;
++    if (!GetLengthPrefixedSlice(&in, &b) || !GetLengthPrefixedSlice(&in, &e) ||
++        !GetVarint64(&in, &seq)) {
++      return Status::Corruption("bad range-deletion block");
++    }
++    t->emplace_back(b, e, seq);
++  }
++  return Status::OK();
++}
++
++void RangeDelIndex::Add(const Slice& begin, const Slice& end,
++                        SequenceNumber seq, int layer) {
++  if (ucmp_->Compare(begin, end) >= 0) return;
++  pending_.emplace_back(begin, end, seq, layer);
++  count_++;
++}
++
++void RangeDelIndex::Finish() {
++  fragments_.clear();
++  if (pending_.empty()) return;
++  // Every begin and end is a cut point.
++  std::vector<std::string> cuts;
++  cuts.reserve(pending_.size() * 2);
++  for (const RangeTombstone& t : pending_) {
++    cuts.push_back(t.begin);
++    cuts.push_back(t.end);
++  }
++  const Comparator* ucmp = ucmp_;
++  auto less = [ucmp](const std::string& a, const std::string& b) {
++    return ucmp->Compare(a, b) < 0;
++  };
++  std::sort(cuts.begin(), cuts.end(), less);
++  cuts.erase(std::unique(cuts.begin(), cuts.end(),
++                         [ucmp](const std::string& a, const std::string& b) {
++                           return ucmp->Compare(a, b) == 0;
++                         }),
++             cuts.end());
++  // Sweep: tombstones sorted by begin enter, and leave at their end.
++  std::sort(pending_.begin(), pending_.end(),
++            [ucmp](const RangeTombstone& a, const RangeTombstone& b) {
++              return ucmp->Compare(a.begin, b.begin) < 0;
++            });
++  std::vector<const RangeTombstone*> active;
++  size_t next = 0;
++  for (size_t i = 0; i + 1 < cuts.size(); i++) {
++    const std::string& lo = cuts[i];
++    while (next < pending_.size() &&
++           ucmp->Compare(pending_[next].begin, lo) <= 0) {
++      active.push_back(&pending_[next]);
++      next++;
++    }
++    active.erase(std::remove_if(active.begin(), active.end(),
++                                [&](const RangeTombstone* t) {
++                                  return ucmp->Compare(t->end, lo) <= 0;
++                                }),
++                 active.end());
++    if (active.empty()) continue;
++    Fragment f;
++    f.begin = lo;
++    f.end = cuts[i + 1];
++    f.seqs.reserve(active.size());
++    for (const RangeTombstone* t : active) f.seqs.emplace_back(t->seq, t->layer);
++    std::sort(f.seqs.begin(), f.seqs.end(),
++              [](const std::pair<SequenceNumber, int>& a,
++                 const std::pair<SequenceNumber, int>& b) {
++                return a.first > b.first;
++              });
++    fragments_.push_back(std::move(f));
++  }
++  pending_.clear();
++  pending_.shrink_to_fit();
++}
++
++const RangeDelIndex::Fragment* RangeDelIndex::Find(
++    const Slice& user_key) const {
++  // Last fragment whose begin <= user_key.
++  size_t lo = 0, hi = fragments_.size();
++  while (lo < hi) {
++    size_t mid = (lo + hi) / 2;
++    if (ucmp_->Compare(fragments_[mid].begin, user_key) <= 0) {
++      lo = mid + 1;
++    } else {
++      hi = mid;
++    }
++  }
++  if (lo == 0) return nullptr;
++  const Fragment& f = fragments_[lo - 1];
++  if (ucmp_->Compare(user_key, f.end) >= 0) return nullptr;
++  return &f;
++}
++
++SequenceNumber RangeDelIndex::Best(const Fragment& f, SequenceNumber snapshot,
++                                   int below_layer) {
++  for (const auto& p : f.seqs) {
++    if (p.first <= snapshot && p.second < below_layer) return p.first;
++  }
++  return 0;
++}
++
++SequenceNumber RangeDelIndex::MaxCovering(const Slice& user_key,
++                                          SequenceNumber snapshot,
++                                          int below_layer) const {
++  const Fragment* f = Find(user_key);
++  return f == nullptr ? 0 : Best(*f, snapshot, below_layer);
++}
++
++bool RangeDelIndex::CoveredRange(const Slice& user_key, SequenceNumber snapshot,
++                                 int below_layer, std::string* begin,
++                                 std::string* end) const {
++  const Fragment* f = Find(user_key);
++  if (f == nullptr || Best(*f, snapshot, below_layer) == 0) return false;
++  *begin = f->begin;
++  *end = f->end;
++  return true;
++}
++
++void RangeDelMap::Add(const Slice& begin, const Slice& end,
++                      SequenceNumber seq) {
++  if (ucmp_->Compare(begin, end) >= 0) return;
++  std::string pos = begin.ToString();
++  const std::string stop = end.ToString();
++  // Split the fragment that straddles `begin`.
++  auto it = frags_.upper_bound(pos);
++  if (it != frags_.begin()) {
++    auto prev = std::prev(it);
++    if (ucmp_->Compare(prev->first, pos) < 0 &&
++        ucmp_->Compare(pos, prev->second.end) < 0) {
++      Frag right = prev->second;
++      prev->second.end = pos;
++      it = frags_.emplace_hint(it, pos, std::move(right));
++    }
++  }
++  it = frags_.lower_bound(pos);
++  while (ucmp_->Compare(pos, stop) < 0) {
++    if (it == frags_.end() || ucmp_->Compare(pos, it->first) < 0) {
++      // a gap up to the next fragment (or the end of the tombstone)
++      std::string gap_end = stop;
++      if (it != frags_.end() && ucmp_->Compare(it->first, stop) < 0) {
++        gap_end = it->first;
++      }
++      Frag f;
++      f.end = gap_end;
++      f.seqs.push_back(seq);
++      frags_.emplace_hint(it, pos, std::move(f));
++      pos = gap_end;
++      continue;
++    }
++    // `it` starts at pos
++    if (ucmp_->Compare(stop, it->second.end) < 0) {
++      Frag right = it->second;
++      it->second.end = stop;
++      frags_.emplace_hint(std::next(it), stop, std::move(right));
++    }
++    std::vector<SequenceNumber>& v = it->second.seqs;
++    v.insert(std::upper_bound(v.begin(), v.end(), seq,
++                              std::greater<SequenceNumber>()),
++             seq);
++    pos = it->second.end;
++    ++it;
++  }
++}
++
++RangeDelMap::Map::const_iterator RangeDelMap::Find(
++    const Slice& user_key) const {
++  auto it = frags_.upper_bound(user_key.ToString());
++  if (it == frags_.begin()) return frags_.end();
++  --it;
++  if (ucmp_->Compare(user_key, it->second.end) >= 0) return frags_.end();
++  return it;
++}
++
++SequenceNumber RangeDelMap::Best(const Frag& f, SequenceNumber snapshot) {
++  for (SequenceNumber s : f.seqs) {
++    if (s <= snapshot) return s;
++  }
++  return 0;
++}
++
++SequenceNumber RangeDelMap::MaxCovering(const Slice& user_key,
++                                        SequenceNumber snapshot) const {
++  auto it = Find(user_key);
++  return it == frags_.end() ? 0 : Best(it->second, snapshot);
++}
++
++bool RangeDelMap::CoveredRange(const Slice& user_key, SequenceNumber snapshot,
++                               std::string* begin, std::string* end) const {
++  auto it = Find(user_key);
++  if (it == frags_.end() || Best(it->second, snapshot) == 0) return false;
++  *begin = it->first;
++  *end = it->second.end;
++  return true;
++}
++
++namespace {
++
++class RangeDelSkippingIterator : public Iterator {
++ public:
++  RangeDelSkippingIterator(Iterator* iter, const InternalKeyComparator* icmp,
++                           std::shared_ptr<const RangeDelView> view, int layer,
++                           SequenceNumber snapshot)
++      : iter_(iter),
++        icmp_(icmp),
++        view_(std::move(view)),
++        layer_(layer),
++        snapshot_(snapshot) {}
++
++  ~RangeDelSkippingIterator() override { delete iter_; }
++
++  bool Valid() const override { return iter_->Valid(); }
++  Slice key() const override { return iter_->key(); }
++  Slice value() const override { return iter_->value(); }
++  Status status() const override { return iter_->status(); }
++
++  void Seek(const Slice& target) override {
++    iter_->Seek(target);
++    SkipForward();
++  }
++  void SeekToFirst() override {
++    iter_->SeekToFirst();
++    SkipForward();
++  }
++  void SeekToLast() override {
++    iter_->SeekToLast();
++    SkipBackward();
++  }
++  void Next() override {
++    iter_->Next();
++    SkipForward();
++  }
++  void Prev() override {
++    iter_->Prev();
++    SkipBackward();
++  }
++
++ private:
++  bool Covered(std::string* begin, std::string* end) {
++    ParsedInternalKey ikey;
++    if (!ParseInternalKey(iter_->key(), &ikey)) return false;
++    return view_->CoveredRange(ikey.user_key, snapshot_, layer_, begin, end);
++  }
++
++  void SkipForward() {
++    std::string b, e;
++    while (iter_->Valid() && Covered(&b, &e)) {
++      std::string target;
++      AppendInternalKey(&target,
++                        ParsedInternalKey(e, kMaxSequenceNumber, kValueTypeForSeek));
++      iter_->Seek(target);
++    }
++  }
++
++  void SkipBackward() {
++    std::string b, e;
++    while (iter_->Valid() && Covered(&b, &e)) {
++      std::string target;
++      AppendInternalKey(&target,
++                        ParsedInternalKey(b, kMaxSequenceNumber, kValueTypeForSeek));
++      iter_->Seek(target);
++      if (iter_->Valid()) {
++        iter_->Prev();
++      } else {
++        iter_->SeekToLast();
++      }
++    }
++  }
++
++  Iterator* const iter_;
++  const InternalKeyComparator* const icmp_;
++  const std::shared_ptr<const RangeDelView> view_;
++  const int layer_;
++  const SequenceNumber snapshot_;
++};
++
++}  // namespace
++
++Iterator* NewRangeDelSkippingIterator(Iterator* iter,
++                                      const InternalKeyComparator* icmp,
++                                      std::shared_ptr<const RangeDelView> view,
++                                      int layer, SequenceNumber snapshot) {
++  return new RangeDelSkippingIterator(iter, icmp, std::move(view), layer,
++                                      snapshot);
++}
++
++}  // namespace leveldb
+diff --git a/db/range_del.h b/db/range_del.h
+new file mode 100644
+index 0000000..ab27ce2
+--- /dev/null
++++ b/db/range_del.h
+@@ -0,0 +1,163 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++//
++// Range tombstones and the index reads use to decide whether an entry is
++// covered by one.
++//
++// A tombstone [begin, end)@seq hides every entry of a key k with
++// begin <= k < end whose sequence number is below seq, from readers whose
++// snapshot is at or above seq.
++
++#ifndef STORAGE_LEVELDB_DB_RANGE_DEL_H_
++#define STORAGE_LEVELDB_DB_RANGE_DEL_H_
++
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "db/dbformat.h"
++#include "leveldb/comparator.h"
++#include "leveldb/slice.h"
++#include "leveldb/status.h"
++
++namespace leveldb {
++
++// Layers order the places data lives by age, newest first: the memtable
++// (0), the immutable memtable (1), then level-0 files newest first, then
++// levels 1, 2, ...  For any key, every entry in a layer is older than every
++// entry of a newer layer that covers the key (a file's range includes its
++// tombstones), so a tombstone hides everything of that key in the layers
++// below its own.
++static const int kLayerMem = 0;
++static const int kLayerImm = 1;
++static const int kFirstTableLayer = 2;
++static const int kAllLayers = 1 << 30;
++
++struct RangeTombstone {
++  std::string begin;
++  std::string end;
++  SequenceNumber seq;
++  int layer;  // not stored; see above
++
++  RangeTombstone() : seq(0), layer(0) {}
++  RangeTombstone(const Slice& b, const Slice& e, SequenceNumber s, int l = 0)
++      : begin(b.ToString()), end(e.ToString()), seq(s), layer(l) {}
++};
++
++// Serialized form, stored in a table's range-deletion block:
++//   count: varint32, then count x (begin: varstring, end: varstring,
++//   seq: varint64)
++void EncodeRangeTombstones(const std::vector<RangeTombstone>& t,
++                           std::string* dst);
++Status DecodeRangeTombstones(const Slice& src, std::vector<RangeTombstone>* t);
++
++// An immutable index over a set of tombstones.  The key space is cut into
++// fragments at every begin and end key; each fragment keeps the sequence
++// numbers of the tombstones that cover it, largest first.
++class RangeDelIndex {
++ public:
++  explicit RangeDelIndex(const Comparator* ucmp) : ucmp_(ucmp) {}
++
++  RangeDelIndex(const RangeDelIndex&) = delete;
++  RangeDelIndex& operator=(const RangeDelIndex&) = delete;
++
++  // Add() any number of tombstones, then Finish() once before querying.
++  void Add(const Slice& begin, const Slice& end, SequenceNumber seq,
++           int layer = 0);
++  void Add(const RangeTombstone& t) { Add(t.begin, t.end, t.seq, t.layer); }
++  void Finish();
++
++  bool empty() const { return fragments_.empty(); }
++  size_t size() const { return count_; }
++
++  // The largest sequence number <= snapshot among the tombstones of layers
++  // below `below_layer` that cover user_key, or 0 if there is none.
++  SequenceNumber MaxCovering(const Slice& user_key, SequenceNumber snapshot,
++                             int below_layer = kAllLayers) const;
++
++  // Is an entry for user_key written at `seq` hidden from readers at
++  // `snapshot`?
++  bool Covers(const Slice& user_key, SequenceNumber seq,
++              SequenceNumber snapshot) const {
++    return !fragments_.empty() && MaxCovering(user_key, snapshot) > seq;
++  }
++
++  // If user_key is covered by a tombstone of a layer below `below_layer`
++  // visible at `snapshot`, stores a range around it covered by the same
++  // tombstones in [*begin, *end) and returns true.
++  bool CoveredRange(const Slice& user_key, SequenceNumber snapshot,
++                    int below_layer, std::string* begin,
++                    std::string* end) const;
++
++ private:
++  struct Fragment {
++    std::string begin;  // fragment covers [begin, end)
++    std::string end;
++    // (seq, layer) of the covering tombstones, seq descending
++    std::vector<std::pair<SequenceNumber, int>> seqs;
++  };
++
++  const Fragment* Find(const Slice& user_key) const;
++  static SequenceNumber Best(const Fragment& f, SequenceNumber snapshot,
++                             int below_layer);
++
++  const Comparator* const ucmp_;
++  std::vector<RangeTombstone> pending_;
++  std::vector<Fragment> fragments_;
++  size_t count_ = 0;
++};
++
++// Fragmented tombstones kept up to date as tombstones arrive (a
++// memtable's): the key space covered by tombstones is cut into disjoint
++// fragments, each with the sequence numbers of the tombstones over it.
++// Adding a tombstone costs O(log n + fragments it overlaps); a lookup
++// O(log n).  Not thread-safe.
++class RangeDelMap {
++ public:
++  explicit RangeDelMap(const Comparator* ucmp)
++      : frags_(KeyLess{ucmp}), ucmp_(ucmp) {}
++
++  void Add(const Slice& begin, const Slice& end, SequenceNumber seq);
++  SequenceNumber MaxCovering(const Slice& user_key,
++                             SequenceNumber snapshot) const;
++  bool CoveredRange(const Slice& user_key, SequenceNumber snapshot,
++                    std::string* begin, std::string* end) const;
++
++ private:
++  struct KeyLess {
++    const Comparator* ucmp;
++    bool operator()(const std::string& a, const std::string& b) const {
++      return ucmp->Compare(a, b) < 0;
++    }
++  };
++  struct Frag {
++    std::string end;
++    std::vector<SequenceNumber> seqs;  // descending
++  };
++  typedef std::map<std::string, Frag, KeyLess> Map;
++
++  Map::const_iterator Find(const Slice& user_key) const;
++  static SequenceNumber Best(const Frag& f, SequenceNumber snapshot);
++
++  Map frags_;
++  const Comparator* const ucmp_;
++};
++
++class Iterator;
++class InternalKeyComparator;
++class RangeDelView;
++
++// Wraps an internal iterator over one layer so that it never stops on an
++// entry hidden by a tombstone of a newer layer (below `layer`) visible at
++// `snapshot`: it seeks past the covered range instead, in either direction,
++// without reading what lies inside.  Takes ownership of `iter`.
++Iterator* NewRangeDelSkippingIterator(Iterator* iter,
++                                      const InternalKeyComparator* icmp,
++                                      std::shared_ptr<const RangeDelView> view,
++                                      int layer, SequenceNumber snapshot);
++
++}  // namespace leveldb
++
++#endif  // STORAGE_LEVELDB_DB_RANGE_DEL_H_
+diff --git a/db/range_del_view.h b/db/range_del_view.h
+new file mode 100644
+index 0000000..c0506ac
+--- /dev/null
++++ b/db/range_del_view.h
+@@ -0,0 +1,77 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++//
++// What a read consults to find range tombstones: the memtables' own
++// fragment maps (always current) and an index over the tombstones in the
++// table files of one version.
++
++#ifndef STORAGE_LEVELDB_DB_RANGE_DEL_VIEW_H_
++#define STORAGE_LEVELDB_DB_RANGE_DEL_VIEW_H_
++
++#include <memory>
++#include <string>
++
++#include "db/memtable.h"
++#include "db/range_del.h"
++
++namespace leveldb {
++
++class RangeDelView {
++ public:
++  // The caller keeps mem and imm (may be null) alive while the view is used.
++  RangeDelView(MemTable* mem, MemTable* imm,
++               std::shared_ptr<const RangeDelIndex> tables)
++      : mem_(mem), imm_(imm), tables_(std::move(tables)) {}
++
++  // The largest sequence number <= snapshot among the tombstones of layers
++  // below `below_layer` that cover user_key, or 0.
++  SequenceNumber MaxCovering(const Slice& user_key, SequenceNumber snapshot,
++                             int below_layer = kAllLayers) const {
++    SequenceNumber best = 0;
++    if (below_layer > kLayerMem && mem_ != nullptr &&
++        mem_->NumRangeTombstones() > 0) {
++      best = std::max(best, mem_->MaxCoveringRangeDel(user_key, snapshot));
++    }
++    if (below_layer > kLayerImm && imm_ != nullptr &&
++        imm_->NumRangeTombstones() > 0) {
++      best = std::max(best, imm_->MaxCoveringRangeDel(user_key, snapshot));
++    }
++    if (tables_ != nullptr) {
++      best = std::max(best,
++                      tables_->MaxCovering(user_key, snapshot, below_layer));
++    }
++    return best;
++  }
++
++  bool Covers(const Slice& user_key, SequenceNumber seq,
++              SequenceNumber snapshot) const {
++    return MaxCovering(user_key, snapshot) > seq;
++  }
++
++  bool CoveredRange(const Slice& user_key, SequenceNumber snapshot,
++                    int below_layer, std::string* begin,
++                    std::string* end) const {
++    if (below_layer > kLayerMem && mem_ != nullptr &&
++        mem_->NumRangeTombstones() > 0 &&
++        mem_->CoveredRangeDel(user_key, snapshot, begin, end)) {
++      return true;
++    }
++    if (below_layer > kLayerImm && imm_ != nullptr &&
++        imm_->NumRangeTombstones() > 0 &&
++        imm_->CoveredRangeDel(user_key, snapshot, begin, end)) {
++      return true;
++    }
++    return tables_ != nullptr &&
++           tables_->CoveredRange(user_key, snapshot, below_layer, begin, end);
++  }
++
++ private:
++  MemTable* const mem_;
++  MemTable* const imm_;
++  const std::shared_ptr<const RangeDelIndex> tables_;
++};
++
++}  // namespace leveldb
++
++#endif  // STORAGE_LEVELDB_DB_RANGE_DEL_VIEW_H_
+diff --git a/db/snapshot.h b/db/snapshot.h
+index 9f1d664..351829e 100644
+--- a/db/snapshot.h
++++ b/db/snapshot.h
+@@ -5,6 +5,8 @@
+ #ifndef STORAGE_LEVELDB_DB_SNAPSHOT_H_
+ #define STORAGE_LEVELDB_DB_SNAPSHOT_H_
+ 
++#include <vector>
++
+ #include "db/dbformat.h"
+ #include "leveldb/db.h"
+ 
+@@ -44,6 +46,13 @@ class SnapshotList {
+   }
+ 
+   bool empty() const { return head_.next_ == &head_; }
++
++  // Appends the sequence numbers of all snapshots, oldest first.
++  void GetAll(std::vector<SequenceNumber>* out) const {
++    for (const SnapshotImpl* s = head_.next_; s != &head_; s = s->next_) {
++      out->push_back(s->sequence_number_);
++    }
++  }
+   SnapshotImpl* oldest() const {
+     assert(!empty());
+     return head_.next_;
+diff --git a/db/table_cache.cc b/db/table_cache.cc
+index 73f05fd..af7dfb0 100644
+--- a/db/table_cache.cc
++++ b/db/table_cache.cc
+@@ -99,7 +99,7 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
+ 
+ Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
+                        uint64_t file_size, const Slice& k, void* arg,
+-                       void (*handle_result)(void*, const Slice&,
++                       bool (*handle_result)(void*, const Slice&,
+                                              const Slice&)) {
+   Cache::Handle* handle = nullptr;
+   Status s = FindTable(file_number, file_size, &handle);
+@@ -111,6 +111,22 @@ Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
+   return s;
+ }
+ 
++Status TableCache::GetRangeTombstones(uint64_t file_number,
++                                      uint64_t file_size,
++                                      std::vector<RangeTombstone>* out) {
++  Cache::Handle* handle = nullptr;
++  Status s = FindTable(file_number, file_size, &handle);
++  if (s.ok()) {
++    Table* t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
++    Slice block = t->RangeDeletionBlock();
++    if (!block.empty()) {
++      s = DecodeRangeTombstones(block, out);
++    }
++    cache_->Release(handle);
++  }
++  return s;
++}
++
+ void TableCache::Evict(uint64_t file_number) {
+   char buf[sizeof(file_number)];
+   EncodeFixed64(buf, file_number);
+diff --git a/db/table_cache.h b/db/table_cache.h
+index aac9bfc..48bcdd8 100644
+--- a/db/table_cache.h
++++ b/db/table_cache.h
+@@ -11,6 +11,7 @@
+ #include <string>
+ 
+ #include "db/dbformat.h"
++#include "db/range_del.h"
+ #include "leveldb/cache.h"
+ #include "leveldb/table.h"
+ #include "port/port.h"
+@@ -35,10 +36,15 @@ class TableCache {
+                         uint64_t file_size, Table** tableptr = nullptr);
+ 
+   // If a seek to internal key "k" in specified file finds an entry,
+-  // call (*handle_result)(arg, found_key, found_value).
++  // call (*handle_result)(arg, found_key, found_value), and again with the
++  // entries after it for as long as it returns true.
+   Status Get(const ReadOptions& options, uint64_t file_number,
+              uint64_t file_size, const Slice& k, void* arg,
+-             void (*handle_result)(void*, const Slice&, const Slice&));
++             bool (*handle_result)(void*, const Slice&, const Slice&));
++
++  // Appends the range tombstones stored in the specified file to *out.
++  Status GetRangeTombstones(uint64_t file_number, uint64_t file_size,
++                            std::vector<RangeTombstone>* out);
+ 
+   // Evict any entry for the specified file number
+   void Evict(uint64_t file_number);
+diff --git a/db/version_edit.cc b/db/version_edit.cc
+index 3e9012f..4c0d3e9 100644
+--- a/db/version_edit.cc
++++ b/db/version_edit.cc
+@@ -20,7 +20,11 @@ enum Tag {
+   kDeletedFile = 6,
+   kNewFile = 7,
+   // 8 was used for large value refs
+-  kPrevLogNumber = 9
++  kPrevLogNumber = 9,
++  // A new file with a range-deletion block.  Same payload as kNewFile;
++  // only written for such files, so databases without range deletions
++  // stay readable by older versions.
++  kNewFileWithRangeDels = 100
+ };
+ 
+ void VersionEdit::Clear() {
+@@ -74,7 +78,7 @@ void VersionEdit::EncodeTo(std::string* dst) const {
+ 
+   for (size_t i = 0; i < new_files_.size(); i++) {
+     const FileMetaData& f = new_files_[i].second;
+-    PutVarint32(dst, kNewFile);
++    PutVarint32(dst, f.has_range_dels ? kNewFileWithRangeDels : kNewFile);
+     PutVarint32(dst, new_files_[i].first);  // level
+     PutVarint64(dst, f.number);
+     PutVarint64(dst, f.file_size);
+@@ -175,6 +179,8 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
+         break;
+ 
+       case kNewFile:
++      case kNewFileWithRangeDels:
++        f.has_range_dels = (tag == kNewFileWithRangeDels);
+         if (GetLevel(&input, &level) && GetVarint64(&input, &f.number) &&
+             GetVarint64(&input, &f.file_size) &&
+             GetInternalKey(&input, &f.smallest) &&
+diff --git a/db/version_edit.h b/db/version_edit.h
+index 137b4b1..bfb75d6 100644
+--- a/db/version_edit.h
++++ b/db/version_edit.h
+@@ -16,7 +16,8 @@ namespace leveldb {
+ class VersionSet;
+ 
+ struct FileMetaData {
+-  FileMetaData() : refs(0), allowed_seeks(1 << 30), file_size(0) {}
++  FileMetaData()
++      : refs(0), allowed_seeks(1 << 30), file_size(0), has_range_dels(false) {}
+ 
+   int refs;
+   int allowed_seeks;  // Seeks allowed until compaction
+@@ -24,6 +25,11 @@ struct FileMetaData {
+   uint64_t file_size;    // File size in bytes
+   InternalKey smallest;  // Smallest internal key served by table
+   InternalKey largest;   // Largest internal key served by table
++  // The table has a range-deletion block.  smallest/largest then also
++  // cover the tombstones: smallest <= (begin, seq), and largest >=
++  // (end, kMaxSequenceNumber), the first internal key of the (excluded)
++  // end.
++  bool has_range_dels;
+ };
+ 
+ class VersionEdit {
+@@ -61,12 +67,14 @@ class VersionEdit {
+   // REQUIRES: This version has not been saved (see VersionSet::SaveTo)
+   // REQUIRES: "smallest" and "largest" are smallest and largest keys in file
+   void AddFile(int level, uint64_t file, uint64_t file_size,
+-               const InternalKey& smallest, const InternalKey& largest) {
++               const InternalKey& smallest, const InternalKey& largest,
++               bool has_range_dels = false) {
+     FileMetaData f;
+     f.number = file;
+     f.file_size = file_size;
+     f.smallest = smallest;
+     f.largest = largest;
++    f.has_range_dels = has_range_dels;
+     new_files_.push_back(std::make_pair(level, f));
+   }
+ 
+diff --git a/db/version_set.cc b/db/version_set.cc
+index 1963353..8f1a5f2 100644
+--- a/db/version_set.cc
++++ b/db/version_set.cc
+@@ -10,6 +10,7 @@
+ #include "db/filename.h"
+ #include "db/log_reader.h"
+ #include "db/log_writer.h"
++#include "db/lookup_state.h"
+ #include "db/memtable.h"
+ #include "db/table_cache.h"
+ #include "leveldb/env.h"
+@@ -244,34 +245,80 @@ void Version::AddIterators(const ReadOptions& options,
+   }
+ }
+ 
++void Version::AddLayerIterators(
++    const ReadOptions& options, std::vector<std::pair<Iterator*, int>>* iters) {
++  std::vector<FileMetaData*> l0 = files_[0];
++  std::sort(l0.begin(), l0.end(),
++            [](FileMetaData* a, FileMetaData* b) { return a->number > b->number; });
++  int layer = kFirstTableLayer;
++  for (FileMetaData* f : l0) {
++    iters->emplace_back(
++        vset_->table_cache_->NewIterator(options, f->number, f->file_size),
++        layer++);
++  }
++  for (int level = 1; level < config::kNumLevels; level++) {
++    if (!files_[level].empty()) {
++      iters->emplace_back(NewConcatenatingIterator(options, level), layer);
++    }
++    layer++;
++  }
++}
++
+ // Callback from TableCache::Get()
+ namespace {
+-enum SaverState {
+-  kNotFound,
+-  kFound,
+-  kDeleted,
+-  kCorrupt,
+-};
+ struct Saver {
+-  SaverState state;
++  LookupState* state;
+   const Comparator* ucmp;
+-  Slice user_key;
+-  std::string* value;
++  bool corrupt;
+ };
+ }  // namespace
+-static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
++static bool SaveValue(void* arg, const Slice& ikey, const Slice& v) {
+   Saver* s = reinterpret_cast<Saver*>(arg);
+   ParsedInternalKey parsed_key;
+-  if (!ParseInternalKey(ikey, &parsed_key)) {
+-    s->state = kCorrupt;
+-  } else {
+-    if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
+-      s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+-      if (s->state == kFound) {
+-        s->value->assign(v.data(), v.size());
+-      }
++  if (!ParseInternalKey(ikey, &parsed_key) ||
++      parsed_key.type == kTypeRangeDeletion) {
++    s->corrupt = true;
++    return false;
++  }
++  if (s->ucmp->Compare(parsed_key.user_key, s->state->user_key()) != 0) {
++    return false;
++  }
++  return !s->state->Add(parsed_key.type, parsed_key.sequence, v);
++}
++
++bool Version::HasRangeDels() const {
++  for (int level = 0; level < config::kNumLevels; level++) {
++    for (const FileMetaData* f : files_[level]) {
++      if (f->has_range_dels) return true;
++    }
++  }
++  return false;
++}
++
++int Version::LayerOf(int level, const FileMetaData* f) const {
++  if (level > 0) {
++    return kFirstTableLayer + static_cast<int>(files_[0].size()) + level - 1;
++  }
++  int newer = 0;
++  for (const FileMetaData* g : files_[0]) {
++    if (g->number > f->number) newer++;
++  }
++  return kFirstTableLayer + newer;
++}
++
++Status Version::GetRangeTombstones(std::vector<RangeTombstone>* out) {
++  for (int level = 0; level < config::kNumLevels; level++) {
++    for (const FileMetaData* f : files_[level]) {
++      if (!f->has_range_dels) continue;
++      size_t first = out->size();
++      Status s = vset_->table_cache_->GetRangeTombstones(f->number,
++                                                         f->file_size, out);
++      if (!s.ok()) return s;
++      const int layer = LayerOf(level, f);
++      for (size_t i = first; i < out->size(); i++) (*out)[i].layer = layer;
+     }
+   }
++  return Status::OK();
+ }
+ 
+ static bool NewestFirst(FileMetaData* a, FileMetaData* b) {
+@@ -322,7 +369,8 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
+ }
+ 
+ Status Version::Get(const ReadOptions& options, const LookupKey& k,
+-                    std::string* value, GetStats* stats) {
++                    LookupState* lookup, GetStats* stats,
++                    const RangeDelView* rd) {
+   stats->seek_file = nullptr;
+   stats->seek_file_level = -1;
+ 
+@@ -335,12 +383,23 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
+     int last_file_read_level;
+ 
+     VersionSet* vset;
++    Version* version;
++    const RangeDelView* rd;
+     Status s;
+-    bool found;
+ 
+     static bool Match(void* arg, int level, FileMetaData* f) {
+       State* state = reinterpret_cast<State*>(arg);
+ 
++      if (state->rd != nullptr &&
++          state->rd->MaxCovering(state->saver.state->user_key(),
++                                 state->saver.state->snapshot(),
++                                 state->version->LayerOf(level, f)) > 0) {
++        // A newer layer's tombstone hides this file's entries of the key
++        // and everything older.
++        state->saver.state->SettleDeleted();
++        return false;
++      }
++
+       if (state->stats->seek_file == nullptr &&
+           state->last_file_read != nullptr) {
+         // We have had more than one seek for this read.  Charge the 1st file.
+@@ -355,32 +414,19 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
+                                                 f->file_size, state->ikey,
+                                                 &state->saver, SaveValue);
+       if (!state->s.ok()) {
+-        state->found = true;
+         return false;
+       }
+-      switch (state->saver.state) {
+-        case kNotFound:
+-          return true;  // Keep searching in other files
+-        case kFound:
+-          state->found = true;
+-          return false;
+-        case kDeleted:
+-          return false;
+-        case kCorrupt:
+-          state->s =
+-              Status::Corruption("corrupted key for ", state->saver.user_key);
+-          state->found = true;
+-          return false;
++      if (state->saver.corrupt) {
++        state->s = Status::Corruption("corrupted key for ",
++                                      state->saver.state->user_key());
++        return false;
+       }
+-
+-      // Not reached. Added to avoid false compilation warnings of
+-      // "control reaches end of non-void function".
+-      return false;
++      // Keep searching older files unless the lookup is settled.
++      return !state->saver.state->done();
+     }
+   };
+ 
+   State state;
+-  state.found = false;
+   state.stats = stats;
+   state.last_file_read = nullptr;
+   state.last_file_read_level = -1;
+@@ -388,15 +434,16 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
+   state.options = &options;
+   state.ikey = k.internal_key();
+   state.vset = vset_;
++  state.version = this;
++  state.rd = rd;
+ 
+-  state.saver.state = kNotFound;
++  state.saver.state = lookup;
+   state.saver.ucmp = vset_->icmp_.user_comparator();
+-  state.saver.user_key = k.user_key();
+-  state.saver.value = value;
++  state.saver.corrupt = false;
+ 
+-  ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
++  ForEachOverlapping(k.user_key(), state.ikey, &state, &State::Match);
+ 
+-  return state.found ? state.s : Status::NotFound(Slice());
++  return state.s;
+ }
+ 
+ bool Version::UpdateStats(const GetStats& stats) {
+@@ -1065,6 +1112,43 @@ void VersionSet::Finalize(Version* v) {
+ 
+   v->compaction_level_ = best_level;
+   v->compaction_score_ = best_score;
++
++  // Range tombstones hiding data below them.  The estimate counts a deeper
++  // file inside a tombstone in full and one it only overlaps by half.
++  int64_t best_covered = 0;
++  const Comparator* ucmp = icmp_.user_comparator();
++  for (int level = 0; level < config::kNumLevels - 1; level++) {
++    for (FileMetaData* f : v->files_[level]) {
++      if (!f->has_range_dels) continue;
++      std::vector<RangeTombstone> tombstones;
++      if (!table_cache_->GetRangeTombstones(f->number, f->file_size, &tombstones)
++               .ok()) {
++        continue;
++      }
++      int64_t covered = 0;
++      for (const RangeTombstone& t : tombstones) {
++        Slice b(t.begin), e(t.end);
++        for (int deeper = level + 1; deeper < config::kNumLevels; deeper++) {
++          for (FileMetaData* g : v->files_[deeper]) {
++            const Slice gs = g->smallest.user_key(), gl = g->largest.user_key();
++            if (ucmp->Compare(gl, b) < 0 || ucmp->Compare(gs, e) >= 0) continue;
++            if (ucmp->Compare(gs, b) >= 0 && ucmp->Compare(gl, e) < 0) {
++              covered += g->file_size;
++            } else {
++              covered += g->file_size / 2;
++            }
++          }
++        }
++      }
++      const int64_t threshold =
++          std::max<int64_t>(1 << 20, 2 * static_cast<int64_t>(f->file_size));
++      if (covered >= threshold && covered > best_covered) {
++        best_covered = covered;
++        v->rd_file_to_compact_ = f;
++        v->rd_file_to_compact_level_ = level;
++      }
++    }
++  }
+ }
+ 
+ Status VersionSet::WriteSnapshot(log::Writer* log) {
+@@ -1088,7 +1172,8 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
+     const std::vector<FileMetaData*>& files = current_->files_[level];
+     for (size_t i = 0; i < files.size(); i++) {
+       const FileMetaData* f = files[i];
+-      edit.AddFile(level, f->number, f->file_size, f->smallest, f->largest);
++      edit.AddFile(level, f->number, f->file_size, f->smallest, f->largest,
++                   f->has_range_dels);
+     }
+   }
+ 
+@@ -1258,6 +1343,7 @@ Compaction* VersionSet::PickCompaction() {
+   // the compactions triggered by seeks.
+   const bool size_compaction = (current_->compaction_score_ >= 1);
+   const bool seek_compaction = (current_->file_to_compact_ != nullptr);
++  const bool range_del_compaction = (current_->rd_file_to_compact_ != nullptr);
+   if (size_compaction) {
+     level = current_->compaction_level_;
+     assert(level >= 0);
+@@ -1281,6 +1367,10 @@ Compaction* VersionSet::PickCompaction() {
+     level = current_->file_to_compact_level_;
+     c = new Compaction(options_, level);
+     c->inputs_[0].push_back(current_->file_to_compact_);
++  } else if (range_del_compaction) {
++    level = current_->rd_file_to_compact_level_;
++    c = new Compaction(options_, level);
++    c->inputs_[0].push_back(current_->rd_file_to_compact_);
+   } else {
+     return nullptr;
+   }
+@@ -1534,6 +1624,15 @@ bool Compaction::IsBaseLevelForKey(const Slice& user_key) {
+   return true;
+ }
+ 
++bool Compaction::IsBaseLevelForRange(const Slice& begin, const Slice& end) {
++  for (int lvl = level_ + 2; lvl < config::kNumLevels; lvl++) {
++    if (input_version_->OverlapInLevel(lvl, &begin, &end)) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ bool Compaction::ShouldStopBefore(const Slice& internal_key) {
+   const VersionSet* vset = input_version_->vset_;
+   // Scan to find earliest grandparent file that contains key.
+diff --git a/db/version_set.h b/db/version_set.h
+index 69f3d70..231700c 100644
+--- a/db/version_set.h
++++ b/db/version_set.h
+@@ -15,11 +15,13 @@
+ #ifndef STORAGE_LEVELDB_DB_VERSION_SET_H_
+ #define STORAGE_LEVELDB_DB_VERSION_SET_H_
+ 
++#include <atomic>
+ #include <map>
+ #include <set>
+ #include <vector>
+ 
+ #include "db/dbformat.h"
++#include "db/range_del.h"
+ #include "db/version_edit.h"
+ #include "port/port.h"
+ #include "port/thread_annotations.h"
+@@ -32,6 +34,7 @@ class Writer;
+ 
+ class Compaction;
+ class Iterator;
++class LookupState;
+ class MemTable;
+ class TableBuilder;
+ class TableCache;
+@@ -72,8 +75,30 @@ class Version {
+   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
+   void AddIterators(const ReadOptions&, std::vector<Iterator*>* iters);
+ 
+-  Status Get(const ReadOptions&, const LookupKey& key, std::string* val,
+-             GetStats* stats);
++  // The same iterators, level-0 files newest first, each with its layer.
++  void AddLayerIterators(const ReadOptions&,
++                         std::vector<std::pair<Iterator*, int>>* iters);
++
++  // Feeds the entries of key.user_key() at key's sequence number, newest
++  // first, to *lookup until it is settled or the files run out.  Returns
++  // non-OK only on an error.
++  // `rd` (may be null) lets it stop early when a tombstone of a newer layer
++  // hides the rest.
++  Status Get(const ReadOptions&, const LookupKey& key, LookupState* lookup,
++             GetStats* stats, const RangeDelView* rd = nullptr);
++
++  // Does any file of this version hold range tombstones?
++  bool HasRangeDels() const;
++
++  // Unique for the life of the process.
++  uint64_t id() const { return id_; }
++
++  // Appends the range tombstones of every file in this version to *out,
++  // tagged with their layers (see range_del.h).
++  Status GetRangeTombstones(std::vector<RangeTombstone>* out);
++
++  // The layer of file f at `level` in this version.
++  int LayerOf(int level, const FileMetaData* f) const;
+ 
+   // Adds "stats" into the current state.  Returns true if a new
+   // compaction may need to be triggered, false otherwise.
+@@ -127,8 +152,16 @@ class Version {
+         refs_(0),
+         file_to_compact_(nullptr),
+         file_to_compact_level_(-1),
++        rd_file_to_compact_(nullptr),
++        rd_file_to_compact_level_(-1),
+         compaction_score_(-1),
+-        compaction_level_(-1) {}
++        compaction_level_(-1),
++        id_(NextId()) {}
++
++  static uint64_t NextId() {
++    static std::atomic<uint64_t> next{0};
++    return ++next;
++  }
+ 
+   Version(const Version&) = delete;
+   Version& operator=(const Version&) = delete;
+@@ -157,11 +190,18 @@ class Version {
+   FileMetaData* file_to_compact_;
+   int file_to_compact_level_;
+ 
++  // A file whose range tombstones hide a lot of data in deeper levels:
++  // compacting it pushes them down and drops what they cover.
++  FileMetaData* rd_file_to_compact_;
++  int rd_file_to_compact_level_;
++
+   // Level that should be compacted next and its compaction score.
+   // Score < 1 means compaction is not strictly needed.  These fields
+   // are initialized by Finalize().
+   double compaction_score_;
+   int compaction_level_;
++
++  const uint64_t id_;
+ };
+ 
+ class VersionSet {
+@@ -251,7 +291,8 @@ class VersionSet {
+   // Returns true iff some level needs a compaction.
+   bool NeedsCompaction() const {
+     Version* v = current_;
+-    return (v->compaction_score_ >= 1) || (v->file_to_compact_ != nullptr);
++    return (v->compaction_score_ >= 1) || (v->file_to_compact_ != nullptr) ||
++           (v->rd_file_to_compact_ != nullptr);
+   }
+ 
+   // Add all files listed in any live version to *live.
+@@ -349,6 +390,10 @@ class Compaction {
+   // in levels greater than "level+1".
+   bool IsBaseLevelForKey(const Slice& user_key);
+ 
++  // Returns true if no level below the output level holds data in
++  // [begin, end).  Unlike IsBaseLevelForKey, it keeps no state.
++  bool IsBaseLevelForRange(const Slice& begin, const Slice& end);
++
+   // Returns true iff we should stop building the current output
+   // before processing "internal_key".
+   bool ShouldStopBefore(const Slice& internal_key);
+diff --git a/db/write_batch.cc b/db/write_batch.cc
+index b54313c..946954a 100644
+--- a/db/write_batch.cc
++++ b/db/write_batch.cc
+@@ -8,7 +8,9 @@
+ //    data: record[count]
+ // record :=
+ //    kTypeValue varstring varstring         |
+-//    kTypeDeletion varstring
++//    kTypeDeletion varstring |
++//    kTypeMerge varstring varstring |
++//    kTypeRangeDeletion varstring varstring      (begin, end)
+ // varstring :=
+ //    len: varint32
+ //    data: uint8[len]
+@@ -32,6 +34,10 @@ WriteBatch::~WriteBatch() = default;
+ 
+ WriteBatch::Handler::~Handler() = default;
+ 
++void WriteBatch::Handler::DeleteRange(const Slice& begin, const Slice& end) {}
++
++void WriteBatch::Handler::Merge(const Slice& key, const Slice& value) {}
++
+ void WriteBatch::Clear() {
+   rep_.clear();
+   rep_.resize(kHeader);
+@@ -68,6 +74,22 @@ Status WriteBatch::Iterate(Handler* handler) const {
+           return Status::Corruption("bad WriteBatch Delete");
+         }
+         break;
++      case kTypeMerge:
++        if (GetLengthPrefixedSlice(&input, &key) &&
++            GetLengthPrefixedSlice(&input, &value)) {
++          handler->Merge(key, value);
++        } else {
++          return Status::Corruption("bad WriteBatch Merge");
++        }
++        break;
++      case kTypeRangeDeletion:
++        if (GetLengthPrefixedSlice(&input, &key) &&
++            GetLengthPrefixedSlice(&input, &value)) {
++          handler->DeleteRange(key, value);
++        } else {
++          return Status::Corruption("bad WriteBatch DeleteRange");
++        }
++        break;
+       default:
+         return Status::Corruption("unknown WriteBatch tag");
+     }
+@@ -108,6 +130,20 @@ void WriteBatch::Delete(const Slice& key) {
+   PutLengthPrefixedSlice(&rep_, key);
+ }
+ 
++void WriteBatch::DeleteRange(const Slice& begin, const Slice& end) {
++  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
++  rep_.push_back(static_cast<char>(kTypeRangeDeletion));
++  PutLengthPrefixedSlice(&rep_, begin);
++  PutLengthPrefixedSlice(&rep_, end);
++}
++
++void WriteBatch::Merge(const Slice& key, const Slice& value) {
++  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
++  rep_.push_back(static_cast<char>(kTypeMerge));
++  PutLengthPrefixedSlice(&rep_, key);
++  PutLengthPrefixedSlice(&rep_, value);
++}
++
+ void WriteBatch::Append(const WriteBatch& source) {
+   WriteBatchInternal::Append(this, &source);
+ }
+@@ -126,6 +162,23 @@ class MemTableInserter : public WriteBatch::Handler {
+     mem_->Add(sequence_, kTypeDeletion, key, Slice());
+     sequence_++;
+   }
++  void DeleteRange(const Slice& begin, const Slice& end) override {
++    mem_->Add(sequence_, kTypeRangeDeletion, begin, end);
++    sequence_++;
++  }
++  void Merge(const Slice& key, const Slice& value) override {
++    mem_->Add(sequence_, kTypeMerge, key, value);
++    sequence_++;
++  }
++};
++
++// Does the batch hold any merge operand?
++class MergeFinder : public WriteBatch::Handler {
++ public:
++  bool found = false;
++  void Put(const Slice& key, const Slice& value) override {}
++  void Delete(const Slice& key) override {}
++  void Merge(const Slice& key, const Slice& value) override { found = true; }
+ };
+ }  // namespace
+ 
+@@ -136,6 +189,12 @@ Status WriteBatchInternal::InsertInto(const WriteBatch* b, MemTable* memtable) {
+   return b->Iterate(&inserter);
+ }
+ 
++bool WriteBatchInternal::HasMerge(const WriteBatch* b) {
++  MergeFinder finder;
++  b->Iterate(&finder);
++  return finder.found;
++}
++
+ void WriteBatchInternal::SetContents(WriteBatch* b, const Slice& contents) {
+   assert(contents.size() >= kHeader);
+   b->rep_.assign(contents.data(), contents.size());
+diff --git a/db/write_batch_internal.h b/db/write_batch_internal.h
+index fce86e3..3495d0b 100644
+--- a/db/write_batch_internal.h
++++ b/db/write_batch_internal.h
+@@ -38,6 +38,9 @@ class WriteBatchInternal {
+   static Status InsertInto(const WriteBatch* batch, MemTable* memtable);
+ 
+   static void Append(WriteBatch* dst, const WriteBatch* src);
++
++  // Does the batch contain a merge operand?
++  static bool HasMerge(const WriteBatch* batch);
+ };
+ 
+ }  // namespace leveldb
+diff --git a/include/leveldb/db.h b/include/leveldb/db.h
+index a13d147..09adc81 100644
+--- a/include/leveldb/db.h
++++ b/include/leveldb/db.h
+@@ -72,6 +72,16 @@ class LEVELDB_EXPORT DB {
+   // Note: consider setting options.sync = true.
+   virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
+ 
++  // Remove every entry whose key is in [begin, end).  Nothing happens when
++  // begin >= end.
++  virtual Status DeleteRange(const WriteOptions& options, const Slice& begin,
++                             const Slice& end);
++
++  // Record a merge operand for "key"; reads fold it into the key's value
++  // with options.merge_operator.  InvalidArgument if there is none.
++  virtual Status Merge(const WriteOptions& options, const Slice& key,
++                       const Slice& value);
++
+   // Apply the specified updates to the database.
+   // Returns OK on success, non-OK on failure.
+   // Note: consider setting options.sync = true.
+diff --git a/include/leveldb/merge_operator.h b/include/leveldb/merge_operator.h
+new file mode 100644
+index 0000000..32bb17d
+--- /dev/null
++++ b/include/leveldb/merge_operator.h
+@@ -0,0 +1,40 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++//
++// A MergeOperator folds merge operands recorded with DB::Merge or
++// WriteBatch::Merge into the value of a key.
++
++#ifndef STORAGE_LEVELDB_INCLUDE_MERGE_OPERATOR_H_
++#define STORAGE_LEVELDB_INCLUDE_MERGE_OPERATOR_H_
++
++#include <string>
++#include <vector>
++
++#include "leveldb/export.h"
++#include "leveldb/slice.h"
++
++namespace leveldb {
++
++class LEVELDB_EXPORT MergeOperator {
++ public:
++  virtual ~MergeOperator();
++
++  // The name of the operator.
++  virtual const char* Name() const = 0;
++
++  // Fold `operands` (oldest first) into `existing` (nullptr when the key has
++  // no value underneath them) and store the result in *new_value.
++  virtual bool FullMerge(const Slice& key, const Slice* existing,
++                         const std::vector<std::string>& operands,
++                         std::string* new_value) const = 0;
++
++  // Optionally fold two adjacent operands, `left` older than `right`, into
++  // one operand with the same effect.  Returns false if it cannot.
++  virtual bool PartialMerge(const Slice& key, const Slice& left,
++                            const Slice& right, std::string* result) const;
++};
++
++}  // namespace leveldb
++
++#endif  // STORAGE_LEVELDB_INCLUDE_MERGE_OPERATOR_H_
+diff --git a/include/leveldb/options.h b/include/leveldb/options.h
+index 0f285bc..2b3cf4d 100644
+--- a/include/leveldb/options.h
++++ b/include/leveldb/options.h
+@@ -16,6 +16,7 @@ class Comparator;
+ class Env;
+ class FilterPolicy;
+ class Logger;
++class MergeOperator;
+ class Snapshot;
+ 
+ // DB contents are stored in a set of blocks, each of which holds a
+@@ -140,6 +141,9 @@ struct LEVELDB_EXPORT Options {
+   // Many applications will benefit from passing the result of
+   // NewBloomFilterPolicy() here.
+   const FilterPolicy* filter_policy = nullptr;
++
++  // If non-null, the operator that DB::Merge operands are folded with.
++  const MergeOperator* merge_operator = nullptr;
+ };
+ 
+ // Options that control read operations
+diff --git a/include/leveldb/table.h b/include/leveldb/table.h
+index a30e903..b7a4237 100644
+--- a/include/leveldb/table.h
++++ b/include/leveldb/table.h
+@@ -58,6 +58,9 @@ class LEVELDB_EXPORT Table {
+   // be close to the file length.
+   uint64_t ApproximateOffsetOf(const Slice& key) const;
+ 
++  // The table's range-deletion block, empty if it has none.
++  Slice RangeDeletionBlock() const;
++
+  private:
+   friend class TableCache;
+   struct Rep;
+@@ -67,10 +70,11 @@ class LEVELDB_EXPORT Table {
+   explicit Table(Rep* rep) : rep_(rep) {}
+ 
+   // Calls (*handle_result)(arg, ...) with the entry found after a call
+-  // to Seek(key).  May not make such a call if filter policy says
+-  // that key is not present.
++  // to Seek(key), then with the entries after it for as long as it returns
++  // true.  May not make such a call if filter policy says that key is not
++  // present.
+   Status InternalGet(const ReadOptions&, const Slice& key, void* arg,
+-                     void (*handle_result)(void* arg, const Slice& k,
++                     bool (*handle_result)(void* arg, const Slice& k,
+                                            const Slice& v));
+ 
+   void ReadMeta(const Footer& footer);
+diff --git a/include/leveldb/table_builder.h b/include/leveldb/table_builder.h
+index 85710c3..f62ba35 100644
+--- a/include/leveldb/table_builder.h
++++ b/include/leveldb/table_builder.h
+@@ -57,6 +57,11 @@ class LEVELDB_EXPORT TableBuilder {
+   // REQUIRES: Finish(), Abandon() have not been called
+   void Flush();
+ 
++  // Store `contents` as the table's range-deletion block (written by
++  // Finish()).  An empty slice means none.
++  // REQUIRES: Finish(), Abandon() have not been called
++  void SetRangeDeletionBlock(const Slice& contents);
++
+   // Return non-ok iff some error has been detected.
+   Status status() const;
+ 
+diff --git a/include/leveldb/write_batch.h b/include/leveldb/write_batch.h
+index 94d4115..08ca941 100644
+--- a/include/leveldb/write_batch.h
++++ b/include/leveldb/write_batch.h
+@@ -37,6 +37,9 @@ class LEVELDB_EXPORT WriteBatch {
+     virtual ~Handler();
+     virtual void Put(const Slice& key, const Slice& value) = 0;
+     virtual void Delete(const Slice& key) = 0;
++    // The default implementations ignore the record.
++    virtual void DeleteRange(const Slice& begin, const Slice& end);
++    virtual void Merge(const Slice& key, const Slice& value);
+   };
+ 
+   WriteBatch();
+@@ -53,6 +56,12 @@ class LEVELDB_EXPORT WriteBatch {
+   // If the database contains a mapping for "key", erase it.  Else do nothing.
+   void Delete(const Slice& key);
+ 
++  // Erase every key in [begin, end).
++  void DeleteRange(const Slice& begin, const Slice& end);
++
++  // Record a merge operand for "key".
++  void Merge(const Slice& key, const Slice& value);
++
+   // Clear all updates buffered in this batch.
+   void Clear();
+ 
+diff --git a/table/table.cc b/table/table.cc
+index 29e835f..93da953 100644
+--- a/table/table.cc
++++ b/table/table.cc
+@@ -33,6 +33,7 @@ struct Table::Rep {
+ 
+   BlockHandle metaindex_handle;  // Handle to metaindex_block: saved from footer
+   Block* index_block;
++  std::string range_del_block;
+ };
+ 
+ Status Table::Open(const Options& options, RandomAccessFile* file,
+@@ -74,18 +75,21 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
+     rep->filter = nullptr;
+     *table = new Table(rep);
+     (*table)->ReadMeta(footer);
++    if (!rep->status.ok()) {
++      s = rep->status;
++      delete *table;
++      *table = nullptr;
++    }
+   }
+ 
+   return s;
+ }
+ 
+ void Table::ReadMeta(const Footer& footer) {
+-  if (rep_->options.filter_policy == nullptr) {
+-    return;  // Do not need any metadata
++  // An empty block is just its restart count and one restart point.
++  if (footer.metaindex_handle().size() <= 8) {
++    return;
+   }
+-
+-  // TODO(sanjay): Skip this if footer.metaindex_handle() size indicates
+-  // it is an empty block.
+   ReadOptions opt;
+   if (rep_->options.paranoid_checks) {
+     opt.verify_checksums = true;
+@@ -98,11 +102,28 @@ void Table::ReadMeta(const Footer& footer) {
+   Block* meta = new Block(contents);
+ 
+   Iterator* iter = meta->NewIterator(BytewiseComparator());
+-  std::string key = "filter.";
+-  key.append(rep_->options.filter_policy->Name());
+-  iter->Seek(key);
+-  if (iter->Valid() && iter->key() == Slice(key)) {
+-    ReadFilter(iter->value());
++  if (rep_->options.filter_policy != nullptr) {
++    std::string key = "filter.";
++    key.append(rep_->options.filter_policy->Name());
++    iter->Seek(key);
++    if (iter->Valid() && iter->key() == Slice(key)) {
++      ReadFilter(iter->value());
++    }
++  }
++  iter->Seek("leveldb.rangedel");
++  if (iter->Valid() && iter->key() == Slice("leveldb.rangedel")) {
++    Slice v = iter->value();
++    BlockHandle handle;
++    BlockContents block;
++    ReadOptions ropt;
++    ropt.verify_checksums = true;
++    if (handle.DecodeFrom(&v).ok() &&
++        ReadBlock(rep_->file, ropt, handle, &block).ok()) {
++      rep_->range_del_block.assign(block.data.data(), block.data.size());
++      if (block.heap_allocated) delete[] block.data.data();
++    } else {
++      rep_->status = Status::Corruption("unreadable range-deletion block");
++    }
+   }
+   delete iter;
+   delete meta;
+@@ -211,8 +232,10 @@ Iterator* Table::NewIterator(const ReadOptions& options) const {
+       &Table::BlockReader, const_cast<Table*>(this), options);
+ }
+ 
++Slice Table::RangeDeletionBlock() const { return rep_->range_del_block; }
++
+ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
+-                          void (*handle_result)(void*, const Slice&,
++                          bool (*handle_result)(void*, const Slice&,
+                                                 const Slice&)) {
+   Status s;
+   Iterator* iiter = rep_->index_block->NewIterator(rep_->options.comparator);
+@@ -227,8 +250,22 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
+     } else {
+       Iterator* block_iter = BlockReader(this, options, iiter->value());
+       block_iter->Seek(k);
+-      if (block_iter->Valid()) {
+-        (*handle_result)(arg, block_iter->key(), block_iter->value());
++      // Keep going, into the following blocks if need be, for as long as
++      // the caller wants more entries.
++      while (true) {
++        if (block_iter->Valid()) {
++          if (!(*handle_result)(arg, block_iter->key(), block_iter->value())) {
++            break;
++          }
++          block_iter->Next();
++          continue;
++        }
++        if (!block_iter->status().ok()) break;
++        iiter->Next();
++        if (!iiter->Valid()) break;
++        delete block_iter;
++        block_iter = BlockReader(this, options, iiter->value());
++        block_iter->SeekToFirst();
+       }
+       s = block_iter->status();
+       delete block_iter;
+diff --git a/table/table_builder.cc b/table/table_builder.cc
+index 29a619d..d3930cc 100644
+--- a/table/table_builder.cc
++++ b/table/table_builder.cc
+@@ -59,6 +59,8 @@ struct TableBuilder::Rep {
+   bool pending_index_entry;
+   BlockHandle pending_handle;  // Handle to add to index block
+ 
++  std::string range_del_block;
++
+   std::string compressed_output;
+ };
+ 
+@@ -193,6 +195,11 @@ void TableBuilder::WriteRawBlock(const Slice& block_contents,
+   }
+ }
+ 
++void TableBuilder::SetRangeDeletionBlock(const Slice& contents) {
++  assert(!rep_->closed);
++  rep_->range_del_block.assign(contents.data(), contents.size());
++}
++
+ Status TableBuilder::status() const { return rep_->status; }
+ 
+ Status TableBuilder::Finish() {
+@@ -202,6 +209,7 @@ Status TableBuilder::Finish() {
+   r->closed = true;
+ 
+   BlockHandle filter_block_handle, metaindex_block_handle, index_block_handle;
++  BlockHandle range_del_handle;
+ 
+   // Write filter block
+   if (ok() && r->filter_block != nullptr) {
+@@ -209,6 +217,11 @@ Status TableBuilder::Finish() {
+                   &filter_block_handle);
+   }
+ 
++  // Write range-deletion block
++  if (ok() && !r->range_del_block.empty()) {
++    WriteRawBlock(r->range_del_block, kNoCompression, &range_del_handle);
++  }
++
+   // Write metaindex block
+   if (ok()) {
+     BlockBuilder meta_index_block(&r->options);
+@@ -221,6 +234,12 @@ Status TableBuilder::Finish() {
+       meta_index_block.Add(key, handle_encoding);
+     }
+ 
++    if (!r->range_del_block.empty()) {
++      std::string handle_encoding;
++      range_del_handle.EncodeTo(&handle_encoding);
++      meta_index_block.Add("leveldb.rangedel", handle_encoding);
++    }
++
+     // TODO(postrelease): Add stats and other meta blocks
+     WriteBlock(&meta_index_block, &metaindex_block_handle);
+   }
+diff --git a/util/merge_operator.cc b/util/merge_operator.cc
+new file mode 100644
+index 0000000..6552df7
+--- /dev/null
++++ b/util/merge_operator.cc
+@@ -0,0 +1,17 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++
++#include "leveldb/merge_operator.h"
++
++namespace leveldb {
++
++MergeOperator::~MergeOperator() = default;
++
++bool MergeOperator::PartialMerge(const Slice& key, const Slice& left,
++                                 const Slice& right,
++                                 std::string* result) const {
++  return false;
++}
++
++}  // namespace leveldb

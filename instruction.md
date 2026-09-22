@@ -1,32 +1,36 @@
-# Cut write amplification in a pinned LSM-tree engine
+# Add range deletes and merge operators to LevelDB 1.23
 
-Optimize a pinned LSM-tree storage engine across a large heterogeneous workload corpus to substantially reduce geometric-mean write amplification while preserving read/write correctness, snapshot and iterator semantics, crash recovery, and on-disk compatibility.
+`/app/leveldb` is LevelDB 1.23 (`99b3c03b`) with a `pristine` git tag; `/opt/pristine` is an untouched copy. Only `/app/leveldb` is collected.
 
-The optimization may require coordinated changes across the write path, memtable flushing, SSTable construction, compaction scheduling, compaction selection, level management, tombstone handling, background I/O, and version/manifest management.
+Add two features the engine does not have:
 
-The candidate must pass the complete conformance and recovery suite. Performance is evaluated against a pinned baseline and a declared expert reference score.
+* **Range deletes**: `DB::DeleteRange(begin, end)` and `WriteBatch::DeleteRange`, deleting every key in `[begin, end)` as one tombstone. They must work with snapshots, iterators in both directions, reopen, crash recovery and compaction. They must cost about the same however many keys they cover, let scans and point reads skip what they hide without reading it, keep reads fast under 100,000 tombstones, and get their space back through normal background compaction.
+* **Merge operands**: a `MergeOperator` in `Options`, with `DB::Merge` and `WriteBatch::Merge`. Reads fold the operands into the key's value, and compactions may fold them early. A merge must not read the current value.
 
-## Where things are
+`/app/spec.md` is the contract: the exact declarations, the visibility rules in terms of sequence numbers, and the efficiency limits. The verifier compiles its own copy of the harness in `/app/bench` against your `include/`, so the signatures must match.
 
-`/app/leveldb` is LevelDB 1.23 (`99b3c03b`) with a `pristine` git tag; `/opt/pristine` is an untouched copy. Only `/app/leveldb` is collected. `/app/bench` holds the harness the verifier runs, its README (the twelve workloads, the metric) and `bench.py`:
+## How it is checked
 
-    python3 /app/bench/bench.py --quick   # 4 workloads, scale 1 (~2 min)
-    python3 /app/bench/bench.py           # all twelve at scale 3 (~15 min)
-    python3 /app/bench/bench.py --suite   # conformance + recovery slice (~2 min)
+1. **Build**: the tree's CMake (`-DLEVELDB_BUILD_TESTS=OFF`) builds it, and the harness compiles against it.
+2. **API**: fixed checks of the new calls (batch iteration and append, missing merge operator, empty and reversed ranges, write order inside one batch).
+3. **Conformance**: 12000 seeded scenarios of 300 operations and 400 of 3000 operations. Each mixes puts, deletes, range deletes and merges, alone and in batches, with point reads, full scans both ways, iterator walks mixing Seek/Next/Prev, up to three live snapshots, reopens and compactions, on varied buffer, file and block sizes, bloom filters, a small block cache and `reuse_logs`. Every read is compared with a model. Plus 1000 stock-only scenarios.
+4. **Recovery**: 400 crashes at random `Env` events (WAL, table, MANIFEST, file removal, rename). The database must come back holding exactly the acknowledged writes (the one in flight may or may not be there), and must stay usable. Plus eleven fixed crash points in a larger stock workload.
+5. **Compatibility**: a database that never saw the new records stays readable both ways with the untouched engine, including after a crash, and six pristine-written databases are read and extended.
+6. **Efficiency**: three cases measured with the kernel's I/O counters and CPU time (`/app/spec.md` section 4). Expanding a range into point deletes, merging by read-modify-write, reading through covered data, or a read cost that grows with the number of tombstones all fail them.
+7. **No regression**: stock workloads at full size, write amplification at most 1.10x the untouched engine's, plus the guardrails in `/app/bench/README.md`.
 
-## Score
+The gate needs every check to pass. The score, `feature_score`, is the mean over API, conformance, recovery and efficiency of the fraction of their checks that passed; the untouched tree scores 0.
 
-Write amplification (WA) = bytes the engine passes to `write(2)` during a workload / its logical bytes (key+value of every put, key of every delete), from the kernel's I/O counters. Per workload, ratio = your WA / the pristine engine's WA, both measured in the same verifier run on a fixed seed you are not given. **Score = geometric mean of the twelve ratios**, lower is better; untouched is 1.0. `bench.py` estimates it against the pristine's numbers on that seed (`/app/bench/scored_baseline.json`). The expert reference scores REFSCORE. Nothing counts unless every gate below passes; the untouched tree passes them all.
+## Self-check
 
-## Gates
+    python3 /app/bench/bench.py            # everything, on seeds the verifier does not use
+    python3 /app/bench/bench.py --suite    # API, scenarios, recovery (~2 min)
+    python3 /app/bench/bench.py --perf     # the efficiency cases
+    python3 /app/bench/bench.py --bench    # the stock regression benchmark (~6 min)
 
-1. Builds with the tree's CMake (`-DLEVELDB_BUILD_TESTS=OFF`); the verifier's harness compiles against `include/`.
-2. Conformance: 2400 seeded scenarios of puts, deletes, batches, range-clearing batches, point reads, iterator walks mixing Seek/Next/Prev, full scans both ways, snapshots, reopens and compactions, every read checked against a model. All must pass.
-3. Recovery: 160 seeded crashes at random Env events (WAL, table, MANIFEST, file removal, rename). Both engines must recover the same acknowledged state from what the candidate left, and the candidate must recover what the pristine left. Plus eleven fixed crash points in a larger workload.
-4. Compatibility: the pristine engine reads the candidate's databases and vice versa; six pristine-written databases (clean, live WAL, torn WAL, `reuse_logs`, filterless tables, one fresh) are read and extended by the candidate.
-5. Guardrails per workload, vs the pristine: never more than **4 level-0 files overlapping one key**; peak table bytes <= 1.25x; bytes on disk after the run <= 1.5x; phase-F reads <= 1.5x (2.5x on `ttl`); peak files <= 3x; no table over 8 MB; RSS <= +96 MB; memtable switches >= 0.8x; time <= 4x + 60 s.
+A failing scenario is reproducible alone (see the docstring of `bench.py`). The verifier runs the same counts on its own seeds, so rare failures matter: a bug that shows up once in 20,000 scenarios can still fail the gate.
 
 ## Constraints
 
-* Keep the public API (`include/leveldb`) source-compatible and the on-disk format unchanged; all I/O goes through the `Env` the engine is given.
-* The verifier uses its own copy of the harness and its own seeds; changing `/app/bench` has no effect.
+* Keep the public API source-compatible. Keep the on-disk formats unchanged for databases without the new records, and route all I/O through the `Env` in the options.
+* The verifier uses its own copy of the harness and its own seeds, so changing `/app/bench` has no effect.
