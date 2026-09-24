@@ -7,13 +7,15 @@ artifacts = [
 
 [task]
 name = "afterquery/storage-engine"
-version = "2.0.0"
+version = "3.0.0"
 description = """
-Add range deletes (range tombstones) and merge operators to a pinned LSM-tree \
-storage engine (LevelDB 1.23), correct under snapshots, iterators, crashes and \
-compactions, and efficient: range deletes cost the same whatever they cover, \
-reads skip what they hide and stay fast under 100,000 tombstones, space comes \
-back through background compaction, merges never read the value."""
+Add range deletes (range tombstones), merge operators and column families to \
+a pinned LSM-tree storage engine (LevelDB 1.23), correct under snapshots, \
+iterators, crashes and compactions, and efficient: range deletes cost the same \
+whatever they cover, reads skip what they hide and stay fast under 100,000 \
+tombstones, space comes back through background compaction, merges never read \
+the value, and one column family's writes never pin the shared log for the \
+others."""
 authors = [
   { name = "nextwave1699", email = "nextwave1699@gmail.com" },
 ]
@@ -24,6 +26,7 @@ keywords = [
   "leveldb",
   "range-tombstones",
   "merge-operator",
+  "column-families",
   "compaction",
   "crash-recovery",
   "c++",
@@ -34,7 +37,7 @@ keywords = [
 author_name = "nextwave1699"
 author_email = "nextwave1699@gmail.com"
 difficulty_explanation = """
-Two features RocksDB took years to get right, added to LevelDB under a \
+Three features RocksDB took years to get right, added to LevelDB under a \
 model-checked conformance suite (12,000 seeded scenarios plus 400 long ones, \
 every read compared with a model), 400 randomized crashes, compatibility with \
 the untouched engine and efficiency limits measured by the kernel.  Range \
@@ -52,13 +55,20 @@ continue across memtables and levels collecting operands, iterators fold \
 them forwards and backwards (switching direction mid-key), and compactions \
 fold them per snapshot stripe with PartialMerge/FullMerge without any \
 reader being able to tell.  The operator in the harness is not commutative, \
-so any ordering or duplication mistake shows.  The obvious shortcuts \
-(expanding a range into point deletes, read-modify-write merges, a global \
-tombstone list rebuilt per read, iterators that filter covered keys one by \
-one) are each rejected by an efficiency limit, by a margin of 5-30x.  Bugs \
-that appear once in thousands of scenarios still fail the gate."""
+so any ordering or duplication mistake shows.  Column families cut across \
+all of it: per-family memtables, levels, options and manifests, one shared \
+write-ahead log whose files may only be deleted once every family has \
+flushed past them (so a family nobody writes to has to be flushed to let \
+the log go), batches that apply atomically across families, snapshots and \
+sequence numbers shared by all of them, creation and drops that survive a \
+crash, and a reopen that must be told which families to expect.  The \
+obvious shortcuts (expanding a range into point deletes, read-modify-write \
+merges, a global tombstone list rebuilt per read, iterators that filter \
+covered keys one by one, keeping every log file) are each rejected by an \
+efficiency limit, by a margin of 5-30x.  Bugs that appear once in thousands \
+of scenarios still fail the gate."""
 solution_explanation = """
-solution/reference.patch (+1900 lines over 32 files).  Tombstones: a \
+solution/reference.patch (+3400 lines over 34 files).  Tombstones: a \
 kTypeRangeDeletion record in WriteBatch/WAL; in the memtable an insertion-order \
 list plus an incrementally fragmented map (O(log n) coverage queries); in \
 tables a range-deletion block named in the metaindex, with file bounds widened \
@@ -75,23 +85,33 @@ operands with FullMerge (base known, or nothing older anywhere) or \
 PartialMerge, never cuts an output file inside a user key, clips tombstones \
 to each output's range, and drops tombstones at the bottom once no snapshot \
 needs them.  VersionSet::Finalize marks a file whose tombstones hide more \
-than max(1 MB, 2x its size) of deeper data for compaction.  It passes every \
-check locally (feature_score 1.0; efficiency margins in README.md)."""
+than max(1 MB, 2x its size) of deeper data for compaction.  Column \
+families: one ColumnFamily per family with its own memtable, table cache, \
+VersionSet and directory (the default family keeps the database directory, \
+so stock databases stay byte-compatible; the others live in cf-<id>/ with \
+their own CURRENT and MANIFEST, named by a FAMILIES file older engines \
+ignore), new write-batch tags carrying the family id, one shared log whose \
+number every family records at its flush point, a log switch on every \
+memtable switch, and forced flushes of the families that hold the oldest \
+log back.  It passes every check locally (feature_score 1.0; efficiency \
+margins in README.md)."""
 verification_explanation = """
 A separate verifier image carries the sealed pristine source, fixtures and \
 harness.  It builds the pristine engine (root) and the candidate (an \
 unprivileged user that cannot read /tests), compiles its own harness against \
 each (the conformance suite against the candidate's include/, a stock-only \
-build of it against the pristine), then runs: the API checks; 12,000 \
-scenarios with range deletes and merges (300 ops), 400 long ones (3,000 ops) \
-and 1,000 stock ones, every read checked against a model; a small stock \
+build of it against the pristine), then runs: the 28 API checks; 12,000 \
+scenarios with range deletes, merges and up to four column families (300 \
+ops), 400 long ones (3,000 ops) and 1,000 stock ones, every read checked \
+against a model; a small stock \
 workload cross-read by both engines; eleven fixed crash points in a stock \
 workload recovered by both engines; 400 randomized crashes at Env events \
 (60% in scenarios with the new records, recovered by the candidate; 20% \
 stock, recovered identically by both engines; 20% written by the pristine, \
 recovered by the candidate); six pristine-written databases read and \
-extended; the efficiency cases (conftest perf rangedel, manyranges, merge) \
-with limits on kernel I/O counters of each phase, table bytes and CPU time; \
+extended; the efficiency cases (conftest perf rangedel, manyranges, merge, cfwal) \
+with limits on kernel I/O counters of each phase, table bytes, live log \
+bytes and CPU time; \
 and three stock workloads at scale 3 on both engines (write amplification at \
 most 1.10x the pristine's, plus the level-0, space, read, file, memory and \
 time guardrails).  gate_passed (= reward.txt) is 1 only when every stage \
@@ -102,7 +122,7 @@ Both reward files are written with 0 first and rewritten at the end."""
 category = "Software"
 subcategory = "Databases"
 tags = ["implementation", "c++", "leveldb", "lsm-tree", "range-tombstones", "merge-operator", "crash-recovery", "storage"]
-expert_time_estimate_hours = 40
+expert_time_estimate_hours = 70
 relevant_experience = """
 Author of earlier tasks in this series (SQLite query speedup, ray-tracer \
 speedup, interpreter and compiler speedups); has worked on LevelDB/RocksDB-based \
@@ -121,9 +141,9 @@ gate = { key = "gate_passed" }
 objectives = [
   { key = "feature_score", direction = "higher", baseline = 0.0, tolerance = 0.01, tolerance_kind = "abs", unit = "fraction" },
 ]
-# ~6 min on a 16-core desktop for the reference (most of it the stock
+# ~8 min on a 16-core desktop for the reference (most of it the stock
 # benchmark on both engines); slower machines need the headroom.
-verifier_runtime_sec = 2700
+verifier_runtime_sec = 3600
 # apt + untar only, no compiling.
 build_runtime_sec = 1800
 self_check = "/app/bench/bench.py"

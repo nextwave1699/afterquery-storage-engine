@@ -108,14 +108,17 @@ RECOVERY_DEADLINE = 1200
 RECOVERY_CASE_TIMEOUT = 120
 RECOVERY_SEED = 520000
 RECOVERY_CASES = 400
+API_CHECKS = 28                # conftest api
 # Efficiency cases (conftest perf, scale 1).  A limit is either bytes or
 # (factor, slack): at most factor * LOAD_TABLE_BYTES + slack.
 PERF_LIMITS = {
     "rangedel": {"A_WCHAR": 512 << 10, "A_RCHAR": 512 << 10, "S_RCHAR": (0.5, 0),
-                 "R_TABLE_BYTES": (0.3, 1 << 20), "B_TABLE_BYTES": (0.15, 1 << 20), "VMHWM_KB": 1 << 20},
+                 "R_TABLE_BYTES": (0.3, 1 << 20), "B_TABLE_BYTES": (0.15, 1 << 20),
+                 "VMHWM_KB": 1 << 20},
     "manyranges": {"M_CPU_MS": 15000, "VMHWM_KB": 1 << 20},
     "merge": {"A_WCHAR": 150 << 20, "A_RCHAR": 256 << 20, "B_TABLE_BYTES": (1.25, 0),
               "VMHWM_KB": 1 << 20},
+    "cfwal": {"W_LOG_BYTES": 12 << 20, "W_WCHAR": 400 << 20, "VMHWM_KB": 1 << 20},
 }
 PERF_TIMEOUT = 300
 STAGES = ("build", "functional", "api", "conformance", "differential", "crash", "recovery", "compat",
@@ -425,7 +428,7 @@ class Verifier:
         lines = [l for l in out.splitlines() if l.startswith("API ")]
         st["checks"] = lines
         st["passed"] = sum(1 for l in lines if l.split()[2:3] == ["ok"])
-        st["total"] = max(len(lines), 13)
+        st["total"] = max(len(lines), API_CHECKS)
         if status != 0 or st["passed"] != st["total"]:
             bad = [l for l in lines if " FAIL" in l]
             raise Fail("API checks: %d of %d passed (status %s): %s" % (

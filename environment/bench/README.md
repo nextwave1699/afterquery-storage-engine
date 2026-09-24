@@ -5,7 +5,7 @@ contract these check is `/app/spec.md`.
 
 | file | role |
 |---|---|
-| `conftest.cc`, `conf_model.h`, `conf_model.cc` | the conformance suite: seeded scenarios checked against a model (`scenarios`, `--ext` for range deletes and merges), crash and recovery (`crash`, `recover`), the API checks (`api`), the efficiency cases (`perf`) |
+| `conftest.cc`, `conf_model.h`, `conf_model.cc` | the conformance suite: seeded scenarios checked against a model (`scenarios`, `--ext` for range deletes, merges and column families), crash and recovery (`crash`, `recover`), the API checks (`api`), the efficiency cases (`perf`) |
 | `bench_env.h` | the `leveldb::Env` the harness hands to the engine: POSIX files, byte counters, a deterministic single-worker scheduler drained after every operation, crash injection at Env events |
 | `lsmbench.cc`, `workload.h` | the stock-workload harness: `run`, `read`, `check`, `describe`, `selftest` (the untouched API only) |
 | `manifest.py` | parser of CURRENT/MANIFEST: replays the version edits, reports the level layout over time |
@@ -25,7 +25,7 @@ contract these check is `/app/spec.md`.
     conftest-cand scenarios --db /tmp/x --from 7 --to 8 --ext --ops 3000 # a long one
     conftest-cand crash --db /tmp/x --seed 7 --crash log_append:20 --ack /tmp/ack --ext
     conftest-cand recover --db /tmp/x --seed 7 --acked $(cat /tmp/ack) --ext
-    conftest-cand perf --db /tmp/x --case rangedel     # or manyranges, merge
+    conftest-cand perf --db /tmp/x --case rangedel     # or manyranges, merge, cfwal
 
 A failing scenario prints the operation number and the read that went
 wrong.  The operations of a scenario depend only on its seed (see

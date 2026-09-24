@@ -11,7 +11,7 @@ With no stage flag it runs everything (~5 min plus the stock benchmark):
   suite        the API checks, 12000 scenarios with range deletes and merge
                operands (300 ops each), 400 long ones (3000 ops), 1000 stock
                scenarios, and 400 seeded crash-recovery cases
-  perf         the three efficiency cases (spec.md section 4) against their
+  perf         the four efficiency cases (spec.md section 5) against their
                limits
   bench        the stock workloads mixed, ttl and bimodal at scale 3 on both
                engines: write amplification at most 1.10x the pristine's,
@@ -62,10 +62,12 @@ STOCK_SCENARIOS = 1000
 RECOVERY_CASES = 400
 PERF_LIMITS = {
     "rangedel": {"A_WCHAR": 512 << 10, "A_RCHAR": 512 << 10, "S_RCHAR": (0.5, 0),
-                 "R_TABLE_BYTES": (0.3, 1 << 20), "B_TABLE_BYTES": (0.15, 1 << 20), "VMHWM_KB": 1 << 20},
+                 "R_TABLE_BYTES": (0.3, 1 << 20), "B_TABLE_BYTES": (0.15, 1 << 20),
+                 "VMHWM_KB": 1 << 20},
     "manyranges": {"M_CPU_MS": 15000, "VMHWM_KB": 1 << 20},
     "merge": {"A_WCHAR": 150 << 20, "A_RCHAR": 256 << 20, "B_TABLE_BYTES": (1.25, 0),
               "VMHWM_KB": 1 << 20},
+    "cfwal": {"W_LOG_BYTES": 12 << 20, "W_WCHAR": 400 << 20, "VMHWM_KB": 1 << 20},
 }
 
 
@@ -194,7 +196,7 @@ def suite(cand, ref, args, fractions):
         if " FAIL" in l:
             print("    " + l)
     api_ok = sum(1 for l in lines if l.split()[2:3] == ["ok"])
-    api_total = max(len(lines), 13)
+    api_total = max(len(lines), 28)
     print("  %-26s %d/%d%s" % ("api checks", api_ok, api_total, "" if api_ok == api_total else "  FAIL"))
     fractions["api"] = api_ok / float(api_total)
     scale = 10 if args.quick else 1

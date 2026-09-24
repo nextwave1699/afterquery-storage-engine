@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <memory>
 
@@ -111,6 +112,11 @@ ConfShape ShapeFor(uint64_t seed) {
   s.write_buffer = static_cast<uint32_t>(32 * 1024 + r.Below(64 * 1024));
   s.max_file = static_cast<uint32_t>(48 * 1024 + r.Below(96 * 1024));
   s.block_size = r.Chance(50) ? 512 : 2048;
+  for (uint32_t i = 0; i < kMaxFamilies; i++) {
+    s.family_write_buffer[i] =
+        i == 0 ? s.write_buffer
+               : static_cast<uint32_t>(24 * 1024 + r.Below(72 * 1024));
+  }
   return s;
 }
 
@@ -133,26 +139,61 @@ void ScenarioGen::RandomWrite(ConfWrite* w, uint64_t id, bool allow_merge) {
   }
 }
 
-bool ScenarioGen::Next(const ConfModel& model, ConfOp* op) {
+// One of the families that exist right now, the default one most often.
+uint32_t ScenarioGen::PickFamily(const ConfModels& models) {
+  if (!ext_) return 0;
+  uint32_t live[kMaxFamilies];
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < kMaxFamilies; i++) {
+    if (live_[i]) live[n++] = i;
+  }
+  if (n == 1 || rng_.Chance(40)) return 0;
+  return live[rng_.Below(n)];
+}
+
+bool ScenarioGen::Next(const ConfModels& models, ConfOp* op) {
   *op = ConfOp();
   if (done_ >= ops_) return false;
   done_++;
   const uint64_t keys = shape_.keys;
   uint64_t roll = rng_.Below(100);
+  if (ext_ && roll < 4) {
+    // create or drop a column family (durable, so it counts as a write)
+    uint32_t candidates[kMaxFamilies];
+    uint32_t n = 0;
+    const bool create = rng_.Chance(60);
+    for (uint32_t i = 1; i < kMaxFamilies; i++) {
+      if (live_[i] != create) candidates[n++] = i;
+    }
+    if (n > 0) {
+      op->family = candidates[rng_.Below(n)];
+      op->kind = create ? kOpCreate : kOpDrop;
+      live_[op->family] = create;
+      if (!create) snaps_open_ = 0;  // snapshots are checked per family
+      return true;
+    }
+    roll = 50;  // nothing to create or drop: fall through to a read
+  }
+  const uint32_t family = PickFamily(models);
+  op->family = family;
+  const ConfModel& model = models.m[family];
   if (roll < 12) {
     // a single put or delete
     op->kind = kOpWrite;
     op->single = true;
     ConfWrite w;
     RandomWrite(&w, rng_.Below(keys), false);
+    w.family = family;
     op->writes.push_back(w);
   } else if (roll < 30 && !(ext_ && roll >= 20)) {
-    // a batch of puts and deletes (and merges)
+    // a batch of puts and deletes (and merges), sometimes spanning families
     op->kind = kOpWrite;
     uint64_t n = 1 + rng_.Below(rng_.Chance(10) ? 200 : 12);
+    const bool span = ext_ && rng_.Chance(30);
     for (uint64_t i = 0; i < n; i++) {
       ConfWrite w;
       RandomWrite(&w, rng_.Below(keys), ext_);
+      w.family = span ? PickFamily(models) : family;
       op->writes.push_back(w);
     }
   } else if (roll < 25) {
@@ -164,6 +205,7 @@ bool ScenarioGen::Next(const ConfModel& model, ConfOp* op) {
     w.id = rng_.Chance(50) ? rng_.Below(keys) : rng_.Below(keys / 10 + 1);  // some hot keys
     w.end = 0;
     w.value = AffineOperand(1 + rng_.Below(kAffineP - 1), rng_.Below(kAffineP));
+    w.family = family;
     op->writes.push_back(w);
   } else if (roll < 30) {
     // a single range delete, sometimes wide, sometimes a few keys, now and
@@ -175,6 +217,7 @@ bool ScenarioGen::Next(const ConfModel& model, ConfOp* op) {
     w.id = rng_.Below(keys + 10);
     uint64_t span = rng_.Chance(20) ? 1 + rng_.Below(keys) : 1 + rng_.Below(keys / 12 + 2);
     w.end = rng_.Chance(5) ? w.id - rng_.Below(w.id + 1) : w.id + span;
+    w.family = family;
     op->writes.push_back(w);
   } else if (roll < 38) {
     // clear a key range in one batch, then write a few keys back into it;
@@ -188,17 +231,20 @@ bool ScenarioGen::Next(const ConfModel& model, ConfOp* op) {
       for (uint64_t i = 0; i < before; i++) {
         ConfWrite w;
         RandomWrite(&w, lo + rng_.Below(hi - lo + 2), true);
+        w.family = family;
         op->writes.push_back(w);
       }
       ConfWrite d;
       d.kind = kWDeleteRange;
       d.id = lo;
       d.end = hi;
+      d.family = family;
       op->writes.push_back(d);
       uint64_t after = rng_.Below(4);
       for (uint64_t i = 0; i < after; i++) {
         ConfWrite w;
         RandomWrite(&w, lo + rng_.Below(hi - lo + 2), true);
+        w.family = family;
         op->writes.push_back(w);
       }
       if (rng_.Chance(20)) {
@@ -206,18 +252,20 @@ bool ScenarioGen::Next(const ConfModel& model, ConfOp* op) {
         d2.kind = kWDeleteRange;
         d2.id = lo + rng_.Below(hi - lo);
         d2.end = d2.id + rng_.Below(keys / 8 + 1);
+        d2.family = family;
         op->writes.push_back(d2);
       }
     } else {
       for (auto it = model.lower_bound(lo); it != model.end() && it->first < hi; ++it) {
-        op->writes.push_back({kWDelete, it->first, 0, ""});
+        op->writes.push_back({kWDelete, it->first, 0, "", family});
       }
       uint64_t back = rng_.Below(4);
       for (uint64_t i = 0; i < back; i++) {
         uint64_t id = lo + rng_.Below(hi - lo);
-        op->writes.push_back({kWPut, id, 0, ConfValue(id, version_++, rng_.Below(160))});
+        op->writes.push_back(
+            {kWPut, id, 0, ConfValue(id, version_++, rng_.Below(160)), family});
       }
-      if (op->writes.empty()) op->writes.push_back({kWDelete, lo, 0, ""});
+      if (op->writes.empty()) op->writes.push_back({kWDelete, lo, 0, "", family});
     }
   } else if (roll < 50) {
     op->kind = kOpGets;
@@ -256,15 +304,27 @@ bool ScenarioGen::Next(const ConfModel& model, ConfOp* op) {
     for (uint64_t i = 0; i < n; i++) {
       ConfWrite w;
       RandomWrite(&w, (base + i * 7) % keys, ext_);
+      w.family = family;
       op->writes.push_back(w);
     }
   }
   return true;
 }
 
-void ScenarioGen::Apply(const ConfOp& op, ConfModel* model) {
+void ScenarioGen::Apply(const ConfOp& op, ConfModels* models) {
+  if (op.kind == kOpCreate) {
+    models->live[op.family] = true;
+    models->m[op.family].clear();
+    return;
+  }
+  if (op.kind == kOpDrop) {
+    models->live[op.family] = false;
+    models->m[op.family].clear();
+    return;
+  }
   if (op.kind != kOpWrite) return;
   for (const ConfWrite& w : op.writes) {
+    ConfModel* model = &models->m[w.family];
     switch (w.kind) {
       case kWPut:
         (*model)[w.id] = w.value;
@@ -275,7 +335,8 @@ void ScenarioGen::Apply(const ConfOp& op, ConfModel* model) {
       case kWMerge: {
         auto it = model->find(w.id);
         std::vector<std::string> ops{w.value};
-        std::string v = AffineFullMerge(ConfKey(w.id), it == model->end() ? nullptr : &it->second, ops);
+        std::string v = AffineFullMerge(ConfKey(w.id),
+                                        it == model->end() ? nullptr : &it->second, ops);
         (*model)[w.id] = v;
         break;
       }
@@ -286,34 +347,44 @@ void ScenarioGen::Apply(const ConfOp& op, ConfModel* model) {
   }
 }
 
-ConfModel ModelAfterWrites(uint64_t seed, uint64_t ops, bool ext, uint64_t writes, bool* past_end) {
+ConfModels ModelsAfterWrites(uint64_t seed, uint64_t ops, bool ext, uint64_t writes,
+                             bool* past_end) {
   ScenarioGen gen(seed, ops, ext);
-  ConfModel model;
+  ConfModels models;
   ConfOp op;
   uint64_t n = 0;
   *past_end = false;
   while (n < writes) {
-    if (!gen.Next(model, &op)) {
+    if (!gen.Next(models, &op)) {
       *past_end = true;
       break;
     }
-    if (op.kind != kOpWrite) continue;
-    ScenarioGen::Apply(op, &model);
+    if (op.kind != kOpWrite && op.kind != kOpCreate && op.kind != kOpDrop) continue;
+    ScenarioGen::Apply(op, &models);
     n++;
   }
-  return model;
+  return models;
 }
 
 void DestroyScenarioDir(const std::string& dir) {
-  // Remove every file, not only the ones LevelDB knows about.
+  // Remove every file and every column family's directory, not only the
+  // ones the engine knows about.
   DIR* d = opendir(dir.c_str());
   if (d != nullptr) {
     struct dirent* e;
+    std::vector<std::string> subdirs;
     while ((e = readdir(d)) != nullptr) {
       if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-      unlink((dir + "/" + e->d_name).c_str());
+      const std::string path = dir + "/" + e->d_name;
+      struct stat st;
+      if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        subdirs.push_back(path);
+      } else {
+        unlink(path.c_str());
+      }
     }
     closedir(d);
+    for (const std::string& sub : subdirs) DestroyScenarioDir(sub);
   }
   rmdir(dir.c_str());
 }
@@ -333,24 +404,27 @@ struct Db {
   std::unique_ptr<leveldb::Cache> cache;
 #ifndef CONF_PRISTINE
   AffineOperator merge_op;
+  // One handle per family index; null when that family does not exist.
+  leveldb::ColumnFamilyHandle* handles[kMaxFamilies] = {nullptr, nullptr, nullptr,
+                                                        nullptr};
 #endif
+  bool live[kMaxFamilies] = {true, false, false, false};
 
   bool Fail(const std::string& what) {
     if (error.empty()) error = what;
     return false;
   }
 
-  bool Open(bool create) {
+  leveldb::Options OptionsFor(uint32_t family) {
     leveldb::Options o;
-    o.create_if_missing = create;
     o.paranoid_checks = true;
     o.env = &env;
-    o.write_buffer_size = shape.write_buffer;
+    o.write_buffer_size = shape.family_write_buffer[family];
     o.max_file_size = shape.max_file;
-    o.block_size = shape.block_size;
+    o.block_size = family % 2 == 1 ? 1024 : shape.block_size;
     o.compression = leveldb::kNoCompression;
     o.reuse_logs = shape.reuse_logs;
-    if (shape.bloom) {
+    if (shape.bloom || family % 3 == 1) {
       if (!bloom) bloom.reset(leveldb::NewBloomFilterPolicy(10));
       o.filter_policy = bloom.get();
     }
@@ -361,6 +435,30 @@ struct Db {
 #ifndef CONF_PRISTINE
     if (ext) o.merge_operator = &merge_op;
 #endif
+    return o;
+  }
+
+  // Opens with one descriptor per family in `live`.
+  bool Open(bool create) {
+    leveldb::Options o = OptionsFor(0);
+    o.create_if_missing = create;
+#ifndef CONF_PRISTINE
+    if (ext) {
+      std::vector<leveldb::ColumnFamilyDescriptor> families;
+      std::vector<uint32_t> order;
+      for (uint32_t i = 0; i < kMaxFamilies; i++) {
+        if (!live[i]) continue;
+        families.emplace_back(ConfFamilyName(i), OptionsFor(i));
+        order.push_back(i);
+      }
+      std::vector<leveldb::ColumnFamilyHandle*> got;
+      leveldb::Status st = leveldb::DB::Open(o, dir, families, &got, &db);
+      env.WaitIdle();
+      if (!st.ok()) return Fail("open: " + st.ToString());
+      for (size_t i = 0; i < order.size(); i++) handles[order[i]] = got[i];
+      return true;
+    }
+#endif
     leveldb::Status st = leveldb::DB::Open(o, dir, &db);
     env.WaitIdle();
     if (!st.ok()) return Fail("open: " + st.ToString());
@@ -369,33 +467,96 @@ struct Db {
 
   void Close() {
     if (db != nullptr) env.WaitIdle();
+#ifndef CONF_PRISTINE
+    for (uint32_t i = 0; i < kMaxFamilies; i++) {
+      if (handles[i] != nullptr && db != nullptr) {
+        db->DestroyColumnFamilyHandle(handles[i]);
+      }
+      handles[i] = nullptr;
+    }
+#endif
     delete db;
     db = nullptr;
     env.WaitIdle();
+  }
+
+#ifndef CONF_PRISTINE
+  leveldb::ColumnFamilyHandle* Handle(uint32_t family) {
+    return family == 0 ? nullptr : handles[family];
+  }
+
+  bool CreateFamily(uint32_t family) {
+    leveldb::ColumnFamilyHandle* h = nullptr;
+    leveldb::Status st =
+        db->CreateColumnFamily(OptionsFor(family), ConfFamilyName(family), &h);
+    env.WaitIdle();
+    if (!st.ok()) return Fail("CreateColumnFamily " + ConfFamilyName(family) + ": " + st.ToString());
+    handles[family] = h;
+    live[family] = true;
+    return true;
+  }
+
+  bool DropFamily(uint32_t family) {
+    leveldb::Status st = db->DropColumnFamily(handles[family]);
+    env.WaitIdle();
+    if (!st.ok()) return Fail("DropColumnFamily " + ConfFamilyName(family) + ": " + st.ToString());
+    st = db->DestroyColumnFamilyHandle(handles[family]);
+    env.WaitIdle();
+    if (!st.ok()) return Fail("DestroyColumnFamilyHandle: " + st.ToString());
+    handles[family] = nullptr;
+    live[family] = false;
+    return true;
+  }
+#endif
+
+  leveldb::Status Get(const leveldb::ReadOptions& ro, uint32_t family,
+                      const std::string& key, std::string* value) {
+#ifndef CONF_PRISTINE
+    if (family != 0) return db->Get(ro, handles[family], key, value);
+#endif
+    return db->Get(ro, key, value);
+  }
+
+  leveldb::Iterator* NewIterator(const leveldb::ReadOptions& ro, uint32_t family) {
+#ifndef CONF_PRISTINE
+    if (family != 0) return db->NewIterator(ro, handles[family]);
+#endif
+    return db->NewIterator(ro);
+  }
+
+  void CompactRange(uint32_t family, const leveldb::Slice* b, const leveldb::Slice* e) {
+#ifndef CONF_PRISTINE
+    if (family != 0) {
+      db->CompactRange(handles[family], b, e);
+      return;
+    }
+#endif
+    db->CompactRange(b, e);
   }
 };
 
 std::string KeyName(uint64_t id) { return ConfKey(id); }
 
-bool CheckGets(Db* d, const leveldb::ReadOptions& ro, const ConfModel& model, ConfRng* rng,
-               uint64_t keys, uint64_t n, const char* where) {
+bool CheckGets(Db* d, const leveldb::ReadOptions& ro, uint32_t family,
+               const ConfModel& model, ConfRng* rng, uint64_t keys, uint64_t n,
+               const char* where) {
   for (uint64_t i = 0; i < n; i++) {
     uint64_t id = rng->Below(keys + 20);
     std::string got;
-    leveldb::Status st = d->db->Get(ro, KeyName(id), &got);
+    leveldb::Status st = d->Get(ro, family, KeyName(id), &got);
     d->env.WaitIdle();
     auto it = model.find(id);
     if (it == model.end()) {
       if (st.IsNotFound()) continue;
       if (!st.ok()) return d->Fail(std::string(where) + ": Get " + KeyName(id) + ": " + st.ToString());
-      return d->Fail(std::string(where) + ": Get " + KeyName(id) + " found '" + got +
-                     "', expected NotFound");
+      return d->Fail(std::string(where) + " [" + ConfFamilyName(family) + "]: Get " +
+                     KeyName(id) + " found '" + got + "', expected NotFound");
     }
     if (!st.ok()) return d->Fail(std::string(where) + ": Get " + KeyName(id) + ": " + st.ToString() +
                                  ", expected '" + it->second + "'");
     if (got != it->second) {
-      return d->Fail(std::string(where) + ": Get " + KeyName(id) + " returned '" + got +
-                     "', expected '" + it->second + "'");
+      return d->Fail(std::string(where) + " [" + ConfFamilyName(family) + "]: Get " +
+                     KeyName(id) + " returned '" + got + "', expected '" + it->second + "'");
     }
   }
   return true;
@@ -413,8 +574,9 @@ bool SameEntry(Db* d, leveldb::Iterator* it, ConfModel::const_iterator e, const 
   return true;
 }
 
-bool CheckScan(Db* d, const leveldb::ReadOptions& ro, const ConfModel& model, const char* where) {
-  std::unique_ptr<leveldb::Iterator> it(d->db->NewIterator(ro));
+bool CheckScan(Db* d, const leveldb::ReadOptions& ro, uint32_t family,
+               const ConfModel& model, const char* where) {
+  std::unique_ptr<leveldb::Iterator> it(d->NewIterator(ro, family));
   auto e = model.begin();
   for (it->SeekToFirst(); it->Valid(); it->Next(), ++e) {
     if (e == model.end()) return d->Fail(std::string(where) + ": extra key " + it->key().ToString());
@@ -439,9 +601,10 @@ bool CheckScan(Db* d, const leveldb::ReadOptions& ro, const ConfModel& model, co
 
 // Seek, then wander with Next and Prev, changing direction at random: the
 // part of DBIter that is easiest to get wrong.
-bool CheckWalk(Db* d, const leveldb::ReadOptions& ro, const ConfModel& model, uint64_t start,
-               uint64_t steps, ConfRng* rng) {
-  std::unique_ptr<leveldb::Iterator> it(d->db->NewIterator(ro));
+bool CheckWalk(Db* d, const leveldb::ReadOptions& ro, uint32_t family,
+               const ConfModel& model, uint64_t start, uint64_t steps,
+               ConfRng* rng) {
+  std::unique_ptr<leveldb::Iterator> it(d->NewIterator(ro, family));
   it->Seek(KeyName(start));
   auto e = model.lower_bound(start);
   for (uint64_t i = 0;; i++) {
@@ -486,6 +649,50 @@ void WriteAck(int fd, uint64_t n) {
 
 leveldb::Status DoWrite(Db* d, const ConfOp& op) {
   leveldb::WriteOptions wo;
+#ifndef CONF_PRISTINE
+  if (op.single) {
+    const ConfWrite& w = op.writes[0];
+    leveldb::ColumnFamilyHandle* h = d->Handle(w.family);
+    switch (w.kind) {
+      case kWPut:
+        return h == nullptr ? d->db->Put(wo, KeyName(w.id), w.value)
+                            : d->db->Put(wo, h, KeyName(w.id), w.value);
+      case kWDelete:
+        return h == nullptr ? d->db->Delete(wo, KeyName(w.id))
+                            : d->db->Delete(wo, h, KeyName(w.id));
+      case kWMerge:
+        return h == nullptr ? d->db->Merge(wo, KeyName(w.id), w.value)
+                            : d->db->Merge(wo, h, KeyName(w.id), w.value);
+      case kWDeleteRange:
+        return h == nullptr
+                   ? d->db->DeleteRange(wo, KeyName(w.id), KeyName(w.end))
+                   : d->db->DeleteRange(wo, h, KeyName(w.id), KeyName(w.end));
+    }
+  }
+  leveldb::WriteBatch batch;
+  for (const ConfWrite& w : op.writes) {
+    leveldb::ColumnFamilyHandle* h = d->Handle(w.family);
+    switch (w.kind) {
+      case kWPut:
+        if (h == nullptr) batch.Put(KeyName(w.id), w.value);
+        else batch.Put(h, KeyName(w.id), w.value);
+        break;
+      case kWDelete:
+        if (h == nullptr) batch.Delete(KeyName(w.id));
+        else batch.Delete(h, KeyName(w.id));
+        break;
+      case kWMerge:
+        if (h == nullptr) batch.Merge(KeyName(w.id), w.value);
+        else batch.Merge(h, KeyName(w.id), w.value);
+        break;
+      case kWDeleteRange:
+        if (h == nullptr) batch.DeleteRange(KeyName(w.id), KeyName(w.end));
+        else batch.DeleteRange(h, KeyName(w.id), KeyName(w.end));
+        break;
+    }
+  }
+  return d->db->Write(wo, &batch);
+#else
   if (op.single) {
     const ConfWrite& w = op.writes[0];
     switch (w.kind) {
@@ -493,12 +700,6 @@ leveldb::Status DoWrite(Db* d, const ConfOp& op) {
         return d->db->Put(wo, KeyName(w.id), w.value);
       case kWDelete:
         return d->db->Delete(wo, KeyName(w.id));
-#ifndef CONF_PRISTINE
-      case kWMerge:
-        return d->db->Merge(wo, KeyName(w.id), w.value);
-      case kWDeleteRange:
-        return d->db->DeleteRange(wo, KeyName(w.id), KeyName(w.end));
-#endif
       default:
         return leveldb::Status::NotSupported("extension write in a stock scenario");
     }
@@ -512,19 +713,12 @@ leveldb::Status DoWrite(Db* d, const ConfOp& op) {
       case kWDelete:
         batch.Delete(KeyName(w.id));
         break;
-#ifndef CONF_PRISTINE
-      case kWMerge:
-        batch.Merge(KeyName(w.id), w.value);
-        break;
-      case kWDeleteRange:
-        batch.DeleteRange(KeyName(w.id), KeyName(w.end));
-        break;
-#endif
       default:
         return leveldb::Status::NotSupported("extension write in a stock scenario");
     }
   }
   return d->db->Write(wo, &batch);
+#endif
 }
 
 std::string DescribeWrite(const ConfOp& op) {
@@ -532,7 +726,7 @@ std::string DescribeWrite(const ConfOp& op) {
   const ConfWrite& w = op.writes[0];
   const char* names[] = {"Put", "Delete", "Merge", "DeleteRange"};
   s += names[w.kind];
-  s += " " + KeyName(w.id);
+  s += " " + KeyName(w.id) + " in " + ConfFamilyName(w.family);
   if (w.kind == kWDeleteRange) s += ".." + KeyName(w.end);
   return s;
 }
@@ -560,94 +754,137 @@ bool RunScenario(const std::string& dir, uint64_t seed, uint64_t ops, bool ext,
   }
   ScenarioGen gen(seed, ops, ext);
   ConfRng check_rng(seed ^ 0x7E57ull);
-  ConfModel model;
+  ConfModels models;
   struct Snap {
     const leveldb::Snapshot* snap;
-    ConfModel model;
+    ConfModels models;
   };
   std::vector<Snap> snaps;
   uint64_t writes = 0, opno = 0;
   ConfOp op;
   bool ok = true;
-  while (ok && gen.Next(model, &op)) {
+  // Reads of every family the snapshot saw.
+  auto check_snapshot = [&](const Snap& sn, const char* where) {
+    for (uint32_t f = 0; f < kMaxFamilies && ok; f++) {
+      if (!sn.models.live[f] || !d.live[f]) continue;
+      leveldb::ReadOptions ro;
+      ro.snapshot = sn.snap;
+      ok = CheckGets(&d, ro, f, sn.models.m[f], &check_rng, gen.keys(), 16, where) &&
+           CheckScan(&d, ro, f, sn.models.m[f], where);
+    }
+    return ok;
+  };
+  auto check_all = [&](const char* where, uint64_t gets) {
+    for (uint32_t f = 0; f < kMaxFamilies && ok; f++) {
+      if (!d.live[f]) continue;
+      leveldb::ReadOptions ro;
+      ok = CheckGets(&d, ro, f, models.m[f], &check_rng, gen.keys(), gets, where);
+    }
+    return ok;
+  };
+  while (ok && gen.Next(models, &op)) {
     opno++;
     leveldb::ReadOptions ro;
     std::string where = "op " + std::to_string(opno);
+    const uint32_t family = op.family;
+    const ConfModel& model = models.m[family];
     switch (op.kind) {
+      case kOpCreate:
+#ifndef CONF_PRISTINE
+        ok = d.CreateFamily(family);
+        if (ok) {
+          ScenarioGen::Apply(op, &models);
+          WriteAck(ack_fd, ++writes);
+        }
+#endif
+        break;
+      case kOpDrop:
+#ifndef CONF_PRISTINE
+        // The snapshots' views of a dropped family go away with it.
+        for (Snap& sn : snaps) sn.models.live[family] = false;
+        ok = d.DropFamily(family);
+        if (ok) {
+          ScenarioGen::Apply(op, &models);
+          WriteAck(ack_fd, ++writes);
+        }
+#endif
+        break;
       case kOpWrite: {
         leveldb::Status st = DoWrite(&d, op);
         d.env.WaitIdle();
         if (!st.ok()) { ok = d.Fail(where + ": write (" + DescribeWrite(op) + "): " + st.ToString()); break; }
-        ScenarioGen::Apply(op, &model);
+        ScenarioGen::Apply(op, &models);
         WriteAck(ack_fd, ++writes);
         break;
       }
       case kOpGets:
-        ok = CheckGets(&d, ro, model, &check_rng, gen.keys(), op.count, (where + " reads").c_str());
+        ok = CheckGets(&d, ro, family, model, &check_rng, gen.keys(), op.count,
+                       (where + " reads").c_str());
         break;
       case kOpWalk:
-        ok = CheckWalk(&d, ro, model, op.id, op.count, &check_rng);
+        ok = CheckWalk(&d, ro, family, model, op.id, op.count, &check_rng);
         break;
       case kOpScan:
-        ok = CheckScan(&d, ro, model, (where + " scan").c_str());
+        ok = CheckScan(&d, ro, family, model, (where + " scan").c_str());
         break;
       case kOpSnapTake:
-        snaps.push_back({d.db->GetSnapshot(), model});
+        snaps.push_back({d.db->GetSnapshot(), models});
         break;
       case kOpSnapCheck:
         if (op.id < snaps.size()) {
-          ro.snapshot = snaps[op.id].snap;
-          ok = CheckGets(&d, ro, snaps[op.id].model, &check_rng, gen.keys(), 24,
-                         (where + " snapshot reads").c_str()) &&
-               CheckScan(&d, ro, snaps[op.id].model, (where + " snapshot scan").c_str()) &&
-               CheckWalk(&d, ro, snaps[op.id].model, check_rng.Below(gen.keys()), 30, &check_rng);
+          ok = check_snapshot(snaps[op.id], (where + " snapshot").c_str());
           d.db->ReleaseSnapshot(snaps[op.id].snap);
           snaps.erase(snaps.begin() + op.id);
         }
         break;
       case kOpReopen:
-        for (Snap& s : snaps) d.db->ReleaseSnapshot(s.snap);
+        for (Snap& sn : snaps) d.db->ReleaseSnapshot(sn.snap);
         snaps.clear();
         d.Close();
-        ok = d.Open(false) && CheckGets(&d, ro, model, &check_rng, gen.keys(), 32, (where + " after reopen").c_str());
+        ok = d.Open(false) && check_all((where + " after reopen").c_str(), 24);
         break;
       case kOpCompact:
         if (op.count == 0) {
-          d.db->CompactRange(nullptr, nullptr);
+          d.CompactRange(family, nullptr, nullptr);
         } else {
           std::string lo = KeyName(op.id), hi = KeyName(op.id + op.count);
           leveldb::Slice b(lo), e(hi);
-          d.db->CompactRange(&b, &e);
+          d.CompactRange(family, &b, &e);
         }
         d.env.WaitIdle();
-        ok = CheckGets(&d, ro, model, &check_rng, gen.keys(), 32, (where + " after compaction").c_str());
+        ok = check_all((where + " after compaction").c_str(), 24);
         if (ok && !snaps.empty()) {
           // what the compaction kept for the oldest snapshot
-          leveldb::ReadOptions sro;
-          sro.snapshot = snaps[0].snap;
-          ok = CheckScan(&d, sro, snaps[0].model, (where + " snapshot scan after compaction").c_str());
+          ok = check_snapshot(snaps[0], (where + " snapshot after compaction").c_str());
         }
         break;
     }
   }
-  if (ok) {
-    for (size_t i = 0; ok && i < snaps.size(); i++) {
-      leveldb::ReadOptions ro;
-      ro.snapshot = snaps[i].snap;
-      ok = CheckScan(&d, ro, snaps[i].model, "final snapshot scan");
-    }
+  for (size_t i = 0; ok && i < snaps.size(); i++) {
+    ok = check_snapshot(snaps[i], "final snapshot");
   }
-  for (Snap& s : snaps) d.db->ReleaseSnapshot(s.snap);
-  if (ok) ok = CheckScan(&d, leveldb::ReadOptions(), model, "final scan");
+  for (Snap& sn : snaps) d.db->ReleaseSnapshot(sn.snap);
+  for (uint32_t f = 0; ok && f < kMaxFamilies; f++) {
+    if (d.live[f]) ok = CheckScan(&d, leveldb::ReadOptions(), f, models.m[f], "final scan");
+  }
   if (ok) {
     d.Close();
-    ok = d.Open(false) && CheckScan(&d, leveldb::ReadOptions(), model, "final reopen");
+    ok = d.Open(false);
+    for (uint32_t f = 0; ok && f < kMaxFamilies; f++) {
+      if (d.live[f]) ok = CheckScan(&d, leveldb::ReadOptions(), f, models.m[f], "final reopen");
+    }
   }
   if (ok) {
     // compacted all the way down, nothing may change
-    d.db->CompactRange(nullptr, nullptr);
+    for (uint32_t f = 0; f < kMaxFamilies; f++) {
+      if (d.live[f]) d.CompactRange(f, nullptr, nullptr);
+    }
     d.env.WaitIdle();
-    ok = CheckScan(&d, leveldb::ReadOptions(), model, "after final compaction");
+    for (uint32_t f = 0; ok && f < kMaxFamilies; f++) {
+      if (d.live[f]) {
+        ok = CheckScan(&d, leveldb::ReadOptions(), f, models.m[f], "after final compaction");
+      }
+    }
   }
   d.Close();
   if (!ok) *error = d.error;
@@ -657,60 +894,91 @@ bool RunScenario(const std::string& dir, uint64_t seed, uint64_t ops, bool ext,
 bool CheckRecovered(const std::string& dir, uint64_t seed, uint64_t ops, bool ext,
                     uint64_t acked, uint64_t* recovered, std::string* error) {
   bool end0 = false, end1 = false;
-  ConfModel m0 = ModelAfterWrites(seed, ops, ext, acked, &end0);
-  ConfModel m1 = ModelAfterWrites(seed, ops, ext, acked + 1, &end1);
-  Db d;
-  d.dir = dir;
-  d.ext = ext;
-  d.shape = ShapeFor(seed);
-  // With nothing acknowledged the crash may have come before the database
-  // existed, so it may be created here.
-  if (!d.Open(acked == 0)) {
-    *error = d.error;
-    return false;
-  }
-  // Which state is it?  Try the acknowledged one first; a database that
-  // matches neither lost acknowledged writes or kept half a batch.
-  bool is0 = CheckScan(&d, leveldb::ReadOptions(), m0, "recovered");
-  std::string err0 = d.error;
-  d.error.clear();
-  bool is1 = !is0 && !end1 && CheckScan(&d, leveldb::ReadOptions(), m1, "recovered");
-  if (!is0 && !is1) {
-    *error = "recovered state matches neither " + std::to_string(acked) + " nor " +
-             std::to_string(acked + 1) + " writes: " + err0;
-    d.Close();
-    return false;
-  }
-  *recovered = is0 ? acked : acked + 1;
-  // The database has to be usable afterwards: write, reopen, read back.
-  ConfModel& m = is0 ? m0 : m1;
-  ConfRng rng(seed ^ 0xAF7Eull);
-  for (uint64_t i = 0; i < 60; i++) {
-    ConfOp op;
-    op.kind = kOpWrite;
-    op.single = true;
-    uint64_t id = rng.Below(d.shape.keys);
-    ConfWrite w{kWPut, id, 0, ConfValue(id, 1000000000ull + i, 40)};
-    if (ext && i % 3 == 1) {
-      w = ConfWrite{kWMerge, id, 0, AffineOperand(1 + rng.Below(kAffineP - 1), rng.Below(kAffineP))};
-    } else if (ext && i % 10 == 9) {
-      w = ConfWrite{kWDeleteRange, id, id + 1 + rng.Below(30), ""};
-    }
-    op.writes.push_back(w);
-    leveldb::Status st = DoWrite(&d, op);
-    d.env.WaitIdle();
-    if (!st.ok()) {
-      *error = "write after recovery: " + st.ToString();
-      d.Close();
+  ConfModels m0 = ModelsAfterWrites(seed, ops, ext, acked, &end0);
+  ConfModels m1 = ModelsAfterWrites(seed, ops, ext, acked + 1, &end1);
+  // Does the database hold the acknowledged state, or the one the write in
+  // flight would have made?  The families that exist decide which set to
+  // open with, so both are tried in turn.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt == 1 && end1) break;
+    ConfModels& m = attempt == 0 ? m0 : m1;
+    Db d;
+    d.dir = dir;
+    d.ext = ext;
+    d.shape = ShapeFor(seed);
+    for (uint32_t f = 0; f < kMaxFamilies; f++) d.live[f] = m.live[f];
+    // With nothing acknowledged the crash may have come before the
+    // database existed, so it may be created here.
+    if (!d.Open(acked == 0 && attempt == 0)) {
+      if (attempt == 0) continue;  // maybe the family set of acked + 1
+      *error = d.error;
       return false;
     }
-    ScenarioGen::Apply(op, &m);
+    bool match = true;
+    std::string first_error;
+    for (uint32_t f = 0; f < kMaxFamilies && match; f++) {
+      if (!m.live[f]) continue;
+      const std::string what = "recovered " + ConfFamilyName(f);
+      match = CheckScan(&d, leveldb::ReadOptions(), f, m.m[f], what.c_str());
+      if (!match) first_error = d.error;
+      d.error.clear();
+    }
+    if (!match) {
+      d.Close();
+      if (attempt == 0) continue;
+      *error = "recovered state matches neither " + std::to_string(acked) + " nor " +
+               std::to_string(acked + 1) + " writes: " + first_error;
+      return false;
+    }
+    *recovered = acked + attempt;
+    // The database has to be usable afterwards: write, reopen, read back.
+    ConfRng rng(seed ^ 0xAF7Eull);
+    for (uint64_t i = 0; i < 60; i++) {
+      ConfOp op;
+      op.kind = kOpWrite;
+      op.single = true;
+      uint64_t id = rng.Below(d.shape.keys);
+      uint32_t f = 0;
+      if (ext) {
+        uint32_t live[kMaxFamilies];
+        uint32_t n = 0;
+        for (uint32_t j = 0; j < kMaxFamilies; j++) {
+          if (m.live[j]) live[n++] = j;
+        }
+        f = live[rng.Below(n)];
+      }
+      ConfWrite w{kWPut, id, 0, ConfValue(id, 1000000000ull + i, 40), f};
+      if (ext && i % 3 == 1) {
+        w = ConfWrite{kWMerge, id, 0,
+                      AffineOperand(1 + rng.Below(kAffineP - 1), rng.Below(kAffineP)), f};
+      } else if (ext && i % 10 == 9) {
+        w = ConfWrite{kWDeleteRange, id, id + 1 + rng.Below(30), "", f};
+      }
+      op.writes.push_back(w);
+      op.family = f;
+      leveldb::Status st = DoWrite(&d, op);
+      d.env.WaitIdle();
+      if (!st.ok()) {
+        *error = "write after recovery: " + st.ToString();
+        d.Close();
+        return false;
+      }
+      ScenarioGen::Apply(op, &m);
+    }
+    d.Close();
+    bool ok = d.Open(false);
+    for (uint32_t f = 0; ok && f < kMaxFamilies; f++) {
+      if (m.live[f]) {
+        ok = CheckScan(&d, leveldb::ReadOptions(), f, m.m[f], "after recovery and reopen");
+      }
+    }
+    d.Close();
+    if (!ok) *error = d.error;
+    return ok;
   }
-  d.Close();
-  bool ok = d.Open(false) && CheckScan(&d, leveldb::ReadOptions(), m, "after recovery and reopen");
-  d.Close();
-  if (!ok) *error = d.error;
-  return ok;
+  *error = "recovered state matches neither " + std::to_string(acked) + " nor " +
+           std::to_string(acked + 1) + " writes";
+  return false;
 }
 
 #ifndef CONF_PRISTINE
@@ -904,6 +1172,228 @@ bool RunApiChecks(const std::string& dir, int* passed, int* total) {
     env.WaitIdle();
     DestroyScenarioDir(path);
   }
+  // 4. Column families: separate key spaces, per-family options, atomic
+  //    batches across them, drop and re-create, and what a reopen needs.
+  {
+    std::string path = dir + "/families";
+    DestroyScenarioDir(path);
+    mkdir(path.c_str(), 0755);
+    leveldb::Options base;
+    base.create_if_missing = true;
+    base.env = &env;
+    base.write_buffer_size = 64 * 1024;
+    base.compression = leveldb::kNoCompression;
+    leveldb::Options with_merge = base;
+    with_merge.merge_operator = &op;
+
+    leveldb::DB* db = nullptr;
+    leveldb::Status st = leveldb::DB::Open(with_merge, path, &db);
+    env.WaitIdle();
+    if (!st.ok()) {
+      check("open", false, st.ToString());
+      return false;
+    }
+    leveldb::ColumnFamilyHandle* def = db->DefaultColumnFamily();
+    check("default-family", def != nullptr && def->GetName() == "default" &&
+                                def->GetID() == 0,
+          def == nullptr ? "no default handle" : def->GetName());
+
+    // a family with a merge operator and one without
+    leveldb::ColumnFamilyHandle* a = nullptr;
+    leveldb::ColumnFamilyHandle* b = nullptr;
+    st = db->CreateColumnFamily(with_merge, "alpha", &a);
+    leveldb::Status st2 = db->CreateColumnFamily(base, "beta", &b);
+    env.WaitIdle();
+    check("create-family", st.ok() && st2.ok() && a != nullptr && b != nullptr &&
+                               a->GetID() != 0 && a->GetID() != b->GetID(),
+          st.ToString() + "/" + st2.ToString());
+    st = db->CreateColumnFamily(base, "alpha", nullptr);
+    check("create-duplicate", st.IsInvalidArgument(), st.ToString());
+
+    // the same key in three families is three entries
+    db->Put(leveldb::WriteOptions(), "k", "in-default");
+    db->Put(leveldb::WriteOptions(), a, "k", "in-alpha");
+    db->Put(leveldb::WriteOptions(), b, "k", "in-beta");
+    env.WaitIdle();
+    auto get_cf = [&](leveldb::ColumnFamilyHandle* h) {
+      std::string v;
+      leveldb::Status g = h == nullptr ? db->Get(leveldb::ReadOptions(), "k", &v)
+                                       : db->Get(leveldb::ReadOptions(), h, "k", &v);
+      env.WaitIdle();
+      return g.ok() ? v : (g.IsNotFound() ? std::string("<none>") : "<" + g.ToString() + ">");
+    };
+    check("separate-key-spaces",
+          get_cf(nullptr) == "in-default" && get_cf(a) == "in-alpha" &&
+              get_cf(b) == "in-beta",
+          get_cf(nullptr) + "/" + get_cf(a) + "/" + get_cf(b));
+
+    // one batch, three families, and an iterator that sees only its own
+    {
+      leveldb::WriteBatch batch;
+      batch.Put("d1", "x");
+      batch.Put(a, "a1", "y");
+      batch.Merge(a, "a1", "3,4");
+      batch.DeleteRange(b, "k", "l");
+      batch.Delete(a, "gone");
+      st = db->Write(leveldb::WriteOptions(), &batch);
+      env.WaitIdle();
+      std::string want_a1 = AffineFullMerge("a1", nullptr, {"3,4"});
+      std::string v;
+      bool ok_a = db->Get(leveldb::ReadOptions(), a, "a1", &v).ok();
+      std::string got_a1 = ok_a ? v : "<none>";
+      // the merge above starts from "y"
+      std::string base_y = "y";
+      want_a1 = AffineFullMerge("a1", &base_y, {"3,4"});
+      env.WaitIdle();
+      size_t seen = 0;
+      std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions(), a));
+      for (it->SeekToFirst(); it->Valid(); it->Next()) seen++;
+      it.reset();
+      env.WaitIdle();
+      check("batch-across-families",
+            st.ok() && got_a1 == want_a1 && get_cf(b) == "<none>" &&
+                get_cf(nullptr) == "in-default" && seen == 2,
+            st.ToString() + " a1=" + got_a1 + " beta k=" + get_cf(b) +
+                " alpha keys=" + std::to_string(seen));
+    }
+
+    // a merge in a family without an operator is refused, and nothing of
+    // the batch is applied
+    st = db->Merge(leveldb::WriteOptions(), b, "m", "1,1");
+    env.WaitIdle();
+    bool refused = st.IsInvalidArgument();
+    {
+      leveldb::WriteBatch batch;
+      batch.Put(b, "b-put", "v");
+      batch.Merge(b, "m", "1,1");
+      leveldb::Status w = db->Write(leveldb::WriteOptions(), &batch);
+      env.WaitIdle();
+      std::string v;
+      bool applied = db->Get(leveldb::ReadOptions(), b, "b-put", &v).ok();
+      env.WaitIdle();
+      check("per-family-merge-operator",
+            refused && w.IsInvalidArgument() && !applied,
+            st.ToString() + "/" + w.ToString() + (applied ? " applied" : ""));
+    }
+
+    // a snapshot spans the families
+    const leveldb::Snapshot* snap = db->GetSnapshot();
+    db->Put(leveldb::WriteOptions(), "k", "later");
+    db->Put(leveldb::WriteOptions(), a, "k", "later");
+    env.WaitIdle();
+    {
+      leveldb::ReadOptions ro;
+      ro.snapshot = snap;
+      std::string v1, v2;
+      db->Get(ro, "k", &v1);
+      db->Get(ro, a, "k", &v2);
+      env.WaitIdle();
+      check("snapshot-across-families", v1 == "in-default" && v2 == "in-alpha",
+            v1 + "/" + v2);
+    }
+    db->ReleaseSnapshot(snap);
+
+    // reopening needs every family named
+    const uint32_t alpha_id = a->GetID();
+    db->DestroyColumnFamilyHandle(a);
+    db->DestroyColumnFamilyHandle(b);
+    delete db;
+    env.WaitIdle();
+    db = nullptr;
+    std::vector<std::string> names;
+    st = leveldb::DB::ListColumnFamilies(base, path, &names);
+    std::sort(names.begin(), names.end());
+    check("list-families",
+          st.ok() && names.size() == 3 && names[0] == "alpha" &&
+              names[1] == "beta" && names[2] == "default",
+          st.ToString() + " [" + Join(names) + "]");
+
+    leveldb::Options plain = base;
+    plain.create_if_missing = false;
+    st = leveldb::DB::Open(plain, path, &db);
+    env.WaitIdle();
+    check("open-without-families", st.IsInvalidArgument(), st.ToString());
+    if (st.ok()) { delete db; db = nullptr; env.WaitIdle(); }
+
+    std::vector<leveldb::ColumnFamilyDescriptor> descs;
+    descs.emplace_back("default", with_merge);
+    descs.emplace_back("alpha", with_merge);
+    std::vector<leveldb::ColumnFamilyHandle*> handles;
+    st = leveldb::DB::Open(plain, path, descs, &handles, &db);
+    env.WaitIdle();
+    check("open-missing-one-family", st.IsInvalidArgument(), st.ToString());
+    if (st.ok()) { delete db; db = nullptr; env.WaitIdle(); }
+
+    descs.emplace_back("beta", base);
+    descs.emplace_back("gamma", base);
+    handles.clear();
+    st = leveldb::DB::Open(plain, path, descs, &handles, &db);
+    env.WaitIdle();
+    check("open-unknown-family", st.IsInvalidArgument(), st.ToString());
+    if (st.ok()) { delete db; db = nullptr; env.WaitIdle(); }
+
+    leveldb::Options creating = plain;
+    creating.create_missing_column_families = true;
+    handles.clear();
+    st = leveldb::DB::Open(creating, path, descs, &handles, &db);
+    env.WaitIdle();
+    bool reopened = st.ok() && handles.size() == 4;
+    check("open-creating-missing-family",
+          reopened && handles[1]->GetName() == "alpha" &&
+              handles[1]->GetID() == alpha_id && get_cf(handles[1]) == "later",
+          st.ToString() + (reopened ? " k=" + get_cf(handles[1]) : ""));
+    if (!reopened) {
+      check("drop-family", false, "could not reopen");
+      if (db != nullptr) delete db;
+      DestroyScenarioDir(path);
+      return *passed == *total;
+    }
+
+    // dropping: the handle stops working, the name comes back free, and the
+    // default family cannot be dropped
+    st = db->DropColumnFamily(handles[3]);  // gamma
+    env.WaitIdle();
+    leveldb::Status after = db->Put(leveldb::WriteOptions(), handles[3], "x", "y");
+    std::string v;
+    leveldb::Status read_after = db->Get(leveldb::ReadOptions(), handles[3], "x", &v);
+    leveldb::Status def_drop = db->DropColumnFamily(handles[0]);
+    env.WaitIdle();
+    check("drop-family",
+          st.ok() && after.IsInvalidArgument() && read_after.IsInvalidArgument() &&
+              def_drop.IsInvalidArgument(),
+          st.ToString() + "/" + after.ToString() + "/" + read_after.ToString() +
+              "/" + def_drop.ToString());
+    const uint32_t gamma_id = handles[3]->GetID();
+    db->DestroyColumnFamilyHandle(handles[3]);
+    env.WaitIdle();
+
+    leveldb::ColumnFamilyHandle* again = nullptr;
+    st = db->CreateColumnFamily(base, "gamma", &again);
+    env.WaitIdle();
+    bool fresh = st.ok() && again != nullptr;
+    if (fresh) {
+      std::string got;
+      leveldb::Status g = db->Get(leveldb::ReadOptions(), again, "x", &got);
+      env.WaitIdle();
+      fresh = g.IsNotFound() && again->GetID() != gamma_id;
+      db->DestroyColumnFamilyHandle(again);
+      env.WaitIdle();
+    }
+    check("recreate-dropped-family", fresh, st.ToString());
+
+    for (size_t i = 1; i < 3; i++) db->DestroyColumnFamilyHandle(handles[i]);
+    delete db;
+    env.WaitIdle();
+    db = nullptr;
+    names.clear();
+    leveldb::DB::ListColumnFamilies(base, path, &names);
+    std::sort(names.begin(), names.end());
+    check("families-after-reopen",
+          names.size() == 4 && names[0] == "alpha" && names[1] == "beta" &&
+              names[2] == "default" && names[3] == "gamma",
+          "[" + Join(names) + "]");
+    DestroyScenarioDir(path);
+  }
   return *passed == *total;
 }
 
@@ -922,6 +1412,22 @@ void SelfIo(uint64_t* wchar, uint64_t* rchar) {
     else if (sscanf(line, "rchar: %llu", &v) == 1) *rchar = v;
   }
   fclose(f);
+}
+
+uint64_t LogBytes(const std::string& dir) {
+  uint64_t total = 0;
+  DIR* d = opendir(dir.c_str());
+  if (d == nullptr) return 0;
+  struct dirent* e;
+  while ((e = readdir(d)) != nullptr) {
+    std::string n = e->d_name;
+    if (n.size() > 4 && n.compare(n.size() - 4, 4, ".log") == 0) {
+      struct stat st;
+      if (stat((dir + "/" + n).c_str(), &st) == 0) total += st.st_size;
+    }
+  }
+  closedir(d);
+  return total;
 }
 
 uint64_t TableBytes(const std::string& dir) {
@@ -1017,12 +1523,12 @@ bool RunPerfCase(const std::string& dir, const std::string& which, double scale,
   ConfModel model;
   leveldb::WriteOptions wo;
   auto check_gets = [&](uint64_t n, uint64_t keys, const char* where) -> bool {
-    bool ok = CheckGets(&d, leveldb::ReadOptions(), model, &rng, keys, n, where);
+    bool ok = CheckGets(&d, leveldb::ReadOptions(), 0, model, &rng, keys, n, where);
     if (!ok) *error = d.error;
     return ok;
   };
   auto count_scan = [&](const char* where) -> bool {
-    bool ok = CheckScan(&d, leveldb::ReadOptions(), model, where);
+    bool ok = CheckScan(&d, leveldb::ReadOptions(), 0, model, where);
     if (!ok) *error = d.error;
     return ok;
   };
@@ -1118,7 +1624,7 @@ bool RunPerfCase(const std::string& dir, const std::string& which, double scale,
       }
       ok = check_gets(2, keys, "reads between range deletes");
       if (ok && i % 1000 == 999) {
-        ok = CheckWalk(&d, leveldb::ReadOptions(), model, rng.Below(keys), 20, &rng);
+        ok = CheckWalk(&d, leveldb::ReadOptions(), 0, model, rng.Below(keys), 20, &rng);
         if (!ok) *error = d.error;
       }
     }
@@ -1175,6 +1681,124 @@ bool RunPerfCase(const std::string& dir, const std::string& which, double scale,
       Phase c;
       ok = check_gets(4000, keys, "point reads after compaction");
       c.Report("C_WCHAR", "C_RCHAR");
+    }
+  } else if (which == "cfwal") {
+    // Four families share the log.  Two of them are written once and then
+    // left alone; the third takes 60 MB in small batches.  The engine has
+    // to flush the quiet families so the old log files can go.
+    const uint64_t quiet_keys = static_cast<uint64_t>(2000 * scale);
+    const uint64_t busy_keys = static_cast<uint64_t>(60000 * scale);
+    std::vector<leveldb::ColumnFamilyHandle*> handles;
+    for (const char* name : {"a", "b", "c"}) {
+      leveldb::ColumnFamilyHandle* h = nullptr;
+      leveldb::Options o;
+      o.env = &d.env;
+      o.write_buffer_size = 1 << 20;
+      o.max_file_size = d.shape.max_file;
+      o.block_size = d.shape.block_size;
+      o.compression = leveldb::kNoCompression;
+      o.merge_operator = &d.merge_op;
+      leveldb::Status st = d.db->CreateColumnFamily(o, name, &h);
+      d.env.WaitIdle();
+      if (!st.ok()) { *error = "CreateColumnFamily: " + st.ToString(); ok = false; break; }
+      handles.push_back(h);
+    }
+    ConfModel quiet[2];
+    if (ok) {
+      Phase w;
+      for (int q = 0; q < 2 && ok; q++) {
+        for (uint64_t id = 0; id < quiet_keys && ok; id++) {
+          std::string v = ConfValue(id, 1, 900);
+          leveldb::Status st =
+              d.db->Put(wo, handles[q + 1], KeyName(id), v);  // families b and c
+          if (!st.ok()) { *error = "Put: " + st.ToString(); ok = false; }
+          quiet[q][id] = v;
+        }
+      }
+      d.env.WaitIdle();
+      // now only family a is written
+      for (uint64_t i = 0; i < busy_keys && ok; i++) {
+        leveldb::WriteBatch batch;
+        for (int j = 0; j < 4; j++) {
+          uint64_t id = (i * 4 + j) % (busy_keys);
+          std::string v = ConfValue(id, 1 + i, 200);
+          batch.Put(handles[0], KeyName(id), v);
+          model[id] = v;
+        }
+        leveldb::Status st = d.db->Write(wo, &batch);
+        if (!st.ok()) { *error = "Write: " + st.ToString(); ok = false; }
+        if ((i % 4096) == 0) d.env.WaitIdle();
+      }
+      d.env.WaitIdle();
+      w.Report("W_WCHAR", "W_RCHAR");
+      Metric("W_LOG_BYTES", LogBytes(dir));
+    }
+    // every family still reads back correctly, before and after a reopen
+    for (int pass = 0; pass < 2 && ok; pass++) {
+      for (int q = 0; q < 2 && ok; q++) {
+        std::unique_ptr<leveldb::Iterator> it(
+            d.db->NewIterator(leveldb::ReadOptions(), handles[q + 1]));
+        auto e = quiet[q].begin();
+        for (it->SeekToFirst(); it->Valid(); it->Next(), ++e) {
+          if (e == quiet[q].end() || it->key().ToString() != KeyName(e->first) ||
+              it->value().ToString() != e->second) {
+            *error = "family " + std::string(q == 0 ? "b" : "c") +
+                     " lost data at " + it->key().ToString();
+            ok = false;
+            break;
+          }
+        }
+        if (ok && e != quiet[q].end()) {
+          *error = "family " + std::string(q == 0 ? "b" : "c") + " is missing keys";
+          ok = false;
+        }
+        it.reset();
+        d.env.WaitIdle();
+      }
+      if (ok) {
+        std::unique_ptr<leveldb::Iterator> it(
+            d.db->NewIterator(leveldb::ReadOptions(), handles[0]));
+        auto e = model.begin();
+        for (it->SeekToFirst(); it->Valid(); it->Next(), ++e) {
+          if (e == model.end() || it->key().ToString() != KeyName(e->first) ||
+              it->value().ToString() != e->second) {
+            *error = "family a lost data at " + it->key().ToString();
+            ok = false;
+            break;
+          }
+        }
+        if (ok && e != model.end()) { *error = "family a is missing keys"; ok = false; }
+        it.reset();
+        d.env.WaitIdle();
+      }
+      if (ok && pass == 0) {
+        // reopen with every family
+        for (leveldb::ColumnFamilyHandle* h : handles) {
+          d.db->DestroyColumnFamilyHandle(h);
+        }
+        handles.clear();
+        delete d.db;
+        d.db = nullptr;
+        d.env.WaitIdle();
+        std::vector<leveldb::ColumnFamilyDescriptor> descs;
+        leveldb::Options o;
+        o.env = &d.env;
+        o.write_buffer_size = 1 << 20;
+        o.max_file_size = d.shape.max_file;
+        o.block_size = d.shape.block_size;
+        o.compression = leveldb::kNoCompression;
+        o.merge_operator = &d.merge_op;
+        descs.emplace_back("default", o);
+        for (const char* name : {"a", "b", "c"}) descs.emplace_back(name, o);
+        std::vector<leveldb::ColumnFamilyHandle*> got;
+        leveldb::Status st = leveldb::DB::Open(o, dir, descs, &got, &d.db);
+        d.env.WaitIdle();
+        if (!st.ok()) { *error = "reopen: " + st.ToString(); ok = false; break; }
+        handles.assign(got.begin() + 1, got.end());
+      }
+    }
+    for (leveldb::ColumnFamilyHandle* h : handles) {
+      if (d.db != nullptr) d.db->DestroyColumnFamilyHandle(h);
     }
   } else {
     *error = "unknown case " + which;

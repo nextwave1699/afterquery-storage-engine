@@ -1,5 +1,6 @@
 #!/bin/bash
-# Runs the verifier image against the untouched tree, the reference, and
+# Runs the verifier image against the untouched tree, the reference (applied
+# by solution/solve.sh, exactly as the pipeline's oracle run does), and
 # deliberately broken, incomplete or cheating trees, and checks each gets the
 # expected gate with both reward files present.  Only `reference` must pass;
 # feature_score is printed for every case.
@@ -34,14 +35,17 @@ make_case() {
   pristine_tree "$dir"
   local t="$dir/leveldb"
   if [ "$name" != nop ]; then
-    (cd "$t" && patch -p1 -s < "$ROOT/solution/reference.patch") || return 1
+    # The same way the pipeline's oracle run gets it: solution/solve.sh.
+    bash "$ROOT/solution/solve.sh" "$t" > /dev/null || return 1
   fi
   case "$name" in
     nop|reference) ;;
     naive)  # range deletes expanded into point deletes, merges as read-modify-write
       (cd "$t" && patch -p1 -s < "$ROOT/scripts/naive.patch") ;;
     stub)  # the API exists and does nothing
-      edit "$t/db/write_batch.cc" "    mem_->Add(sequence_, kTypeRangeDeletion, begin, end);" "" ;;
+      edit "$t/db/write_batch.cc" "  void DeleteRangeCF(uint32_t cf, const Slice& begin, const Slice& end) override {
+    Add(cf, kTypeRangeDeletion, begin, end);
+  }" "  void DeleteRangeCF(uint32_t cf, const Slice& begin, const Slice& end) override {}" ;;
     mutant:*)  # one of scripts/mutants.py
       python3 - "$t" "${name#mutant:}" "$ROOT/scripts" <<'EOF'
 import sys

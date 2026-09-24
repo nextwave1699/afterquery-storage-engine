@@ -1,10 +1,13 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index f8285b8..0f8476d 100644
+index f8285b8..b2d07e9 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -128,6 +128,10 @@ target_sources(leveldb
+@@ -127,7 +127,13 @@ target_sources(leveldb
+     "db/db_impl.h"
      "db/db_iter.cc"
      "db/db_iter.h"
++    "db/column_family.cc"
++    "db/column_family.h"
      "db/dbformat.cc"
 +    "db/lookup_state.h"
 +    "db/range_del.cc"
@@ -13,7 +16,7 @@ index f8285b8..0f8476d 100644
      "db/dbformat.h"
      "db/dumpfile.cc"
      "db/filename.cc"
-@@ -183,6 +187,7 @@ target_sources(leveldb
+@@ -183,6 +189,7 @@ target_sources(leveldb
      "util/hash.cc"
      "util/hash.h"
      "util/logging.cc"
@@ -21,7 +24,7 @@ index f8285b8..0f8476d 100644
      "util/logging.h"
      "util/mutexlock.h"
      "util/no_destructor.h"
-@@ -201,6 +206,7 @@ target_sources(leveldb
+@@ -201,6 +208,7 @@ target_sources(leveldb
      "${LEVELDB_PUBLIC_INCLUDE_DIR}/export.h"
      "${LEVELDB_PUBLIC_INCLUDE_DIR}/filter_policy.h"
      "${LEVELDB_PUBLIC_INCLUDE_DIR}/iterator.h"
@@ -29,7 +32,7 @@ index f8285b8..0f8476d 100644
      "${LEVELDB_PUBLIC_INCLUDE_DIR}/options.h"
      "${LEVELDB_PUBLIC_INCLUDE_DIR}/slice.h"
      "${LEVELDB_PUBLIC_INCLUDE_DIR}/status.h"
-@@ -462,6 +468,7 @@ if(LEVELDB_INSTALL)
+@@ -462,6 +470,7 @@ if(LEVELDB_INSTALL)
        "${LEVELDB_PUBLIC_INCLUDE_DIR}/export.h"
        "${LEVELDB_PUBLIC_INCLUDE_DIR}/filter_policy.h"
        "${LEVELDB_PUBLIC_INCLUDE_DIR}/iterator.h"
@@ -151,20 +154,262 @@ index 7bd0b80..f66c201 100644
  
  }  // namespace leveldb
  
+diff --git a/db/column_family.cc b/db/column_family.cc
+new file mode 100644
+index 0000000..ddbf6b7
+--- /dev/null
++++ b/db/column_family.cc
+@@ -0,0 +1,86 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++
++#include "db/column_family.h"
++
++#include <cstdlib>
++
++#include "db/filename.h"
++#include "leveldb/env.h"
++#include "util/logging.h"
++
++namespace leveldb {
++
++const char* kDefaultColumnFamilyName = "default";
++
++ColumnFamilyHandle::~ColumnFamilyHandle() = default;
++
++ColumnFamilyDescriptor::ColumnFamilyDescriptor()
++    : name(kDefaultColumnFamilyName) {}
++
++std::string FamiliesFileName(const std::string& dbname) {
++  return dbname + "/FAMILIES";
++}
++
++Status ReadFamilies(Env* env, const std::string& dbname,
++                    std::vector<std::pair<uint32_t, std::string>>* families,
++                    uint32_t* next_id) {
++  families->clear();
++  *next_id = 1;
++  std::string contents;
++  Status s = ReadFileToString(env, FamiliesFileName(dbname), &contents);
++  if (!s.ok()) {
++    // No file: the database has the default family only.
++    return s.IsNotFound() ? Status::OK() : s;
++  }
++  size_t pos = 0;
++  bool first = true;
++  while (pos < contents.size()) {
++    size_t end = contents.find('\n', pos);
++    if (end == std::string::npos) end = contents.size();
++    std::string line = contents.substr(pos, end - pos);
++    pos = end + 1;
++    if (line.empty()) continue;
++    if (first) {
++      *next_id = static_cast<uint32_t>(strtoul(line.c_str(), nullptr, 10));
++      first = false;
++      continue;
++    }
++    size_t space = line.find(' ');
++    if (space == std::string::npos) {
++      return Status::Corruption("malformed FAMILIES line", line);
++    }
++    uint32_t id = static_cast<uint32_t>(strtoul(line.c_str(), nullptr, 10));
++    if (id == 0) return Status::Corruption("bad family id in FAMILIES", line);
++    families->emplace_back(id, line.substr(space + 1));
++  }
++  if (first) return Status::Corruption("empty FAMILIES file");
++  return Status::OK();
++}
++
++Status WriteFamilies(Env* env, const std::string& dbname,
++                     const std::vector<std::pair<uint32_t, std::string>>& families,
++                     uint32_t next_id) {
++  std::string contents = std::to_string(next_id) + "\n";
++  for (const auto& f : families) {
++    contents += std::to_string(f.first) + " " + f.second + "\n";
++  }
++  const std::string path = FamiliesFileName(dbname);
++  const std::string tmp = path + ".dbtmp";
++  WritableFile* file;
++  Status s = env->NewWritableFile(tmp, &file);
++  if (!s.ok()) return s;
++  s = file->Append(contents);
++  if (s.ok()) s = file->Sync();
++  if (s.ok()) s = file->Close();
++  delete file;
++  if (s.ok()) {
++    s = env->RenameFile(tmp, path);
++  } else {
++    env->RemoveFile(tmp);
++  }
++  return s;
++}
++
++}  // namespace leveldb
+diff --git a/db/column_family.h b/db/column_family.h
+new file mode 100644
+index 0000000..d945577
+--- /dev/null
++++ b/db/column_family.h
+@@ -0,0 +1,143 @@
++// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++//
++// One column family: an independent key space with its own options,
++// memtable, levels and manifest, sharing the database's write-ahead log,
++// sequence numbers, snapshots and background thread.
++//
++// The default family (id 0) lives in the database directory itself, so a
++// database that only uses it is exactly what the engine wrote before column
++// families existed.  Every other family lives in `<dbname>/cf-<id>`, with
++// its own CURRENT, MANIFEST and tables.  The FAMILIES file at the top names
++// them; an engine that does not know about it ignores it, and so does the
++// file cleanup of older engines (the name does not parse as one of theirs).
++
++#ifndef STORAGE_LEVELDB_DB_COLUMN_FAMILY_H_
++#define STORAGE_LEVELDB_DB_COLUMN_FAMILY_H_
++
++#include <atomic>
++#include <memory>
++#include <set>
++#include <string>
++#include <vector>
++
++#include "db/dbformat.h"
++#include "db/range_del_view.h"
++#include "leveldb/db.h"
++#include "leveldb/env.h"
++#include "leveldb/options.h"
++
++namespace leveldb {
++
++class MemTable;
++class TableCache;
++class Version;
++class VersionSet;
++
++// Per level compaction stats.  stats[level] is for compactions that
++// produced data for that level.
++struct CompactionStats {
++  CompactionStats() : micros(0), bytes_read(0), bytes_written(0) {}
++
++  void Add(const CompactionStats& c) {
++    this->micros += c.micros;
++    this->bytes_read += c.bytes_read;
++    this->bytes_written += c.bytes_written;
++  }
++
++  int64_t micros;
++  int64_t bytes_read;
++  int64_t bytes_written;
++};
++
++// Information for a manual compaction
++struct ManualCompaction {
++  int level;
++  bool done;
++  const InternalKey* begin;  // null means beginning of key range
++  const InternalKey* end;    // null means end of key range
++  InternalKey tmp_storage;   // Used to keep track of compaction progress
++};
++
++// The range tombstones of one version's tables, cached until it changes.
++struct RangeDelCache {
++  uint64_t version_id = 0;
++  bool version_has_range_dels = false;
++  std::shared_ptr<const RangeDelIndex> index;
++};
++
++struct ColumnFamily {
++  ColumnFamily(uint32_t id_, std::string name_, std::string dir_,
++               const Options& src, const Comparator* user_cmp)
++      : id(id_),
++        name(std::move(name_)),
++        dir(std::move(dir_)),
++        icmp(user_cmp),
++        ipolicy(src.filter_policy),
++        options(src) {}
++
++  const uint32_t id;
++  const std::string name;
++  const std::string dir;
++  const InternalKeyComparator icmp;
++  const InternalFilterPolicy ipolicy;
++  Options options;  // options.comparator == &icmp
++
++  TableCache* table_cache = nullptr;
++  VersionSet* versions = nullptr;
++
++  MemTable* mem = nullptr;
++  MemTable* imm = nullptr;                // memtable being flushed
++  std::atomic<bool> has_imm{false};       // so the bg thread can see imm
++  // The log the current memtable's writes go to; on a flush it becomes the
++  // family's log number, and logs below that are no longer needed for it.
++  uint64_t mem_log_number = 0;
++  uint64_t imm_log_number = 0;  // the same for the memtable being flushed
++
++  bool dropped = false;
++  int refs = 0;  // handles the user holds, plus one for the database
++
++  ManualCompaction* manual = nullptr;
++  RangeDelCache rd_cache;
++  std::set<uint64_t> pending_outputs;
++  CompactionStats stats[config::kNumLevels];
++
++  const Comparator* user_comparator() const { return icmp.user_comparator(); }
++};
++
++class ColumnFamilyHandleImpl : public ColumnFamilyHandle {
++ public:
++  ColumnFamilyHandleImpl(ColumnFamily* cf, DB* db) : cf_(cf), db_(db) {}
++  ~ColumnFamilyHandleImpl() override = default;
++
++  const std::string& GetName() const override { return cf_->name; }
++  uint32_t GetID() const override { return cf_->id; }
++
++  ColumnFamily* cf() const { return cf_; }
++  DB* db() const { return db_; }
++
++ private:
++  ColumnFamily* const cf_;
++  DB* const db_;
++};
++
++// The directory a family's files live in.
++inline std::string ColumnFamilyDir(const std::string& dbname, uint32_t id) {
++  if (id == 0) return dbname;
++  return dbname + "/cf-" + std::to_string(id);
++}
++
++// The FAMILIES file: "<next id>\n" then one "<id> <name>" line per family
++// other than the default.
++std::string FamiliesFileName(const std::string& dbname);
++Status ReadFamilies(Env* env, const std::string& dbname,
++                    std::vector<std::pair<uint32_t, std::string>>* families,
++                    uint32_t* next_id);
++Status WriteFamilies(Env* env, const std::string& dbname,
++                     const std::vector<std::pair<uint32_t, std::string>>& families,
++                     uint32_t next_id);
++
++}  // namespace leveldb
++
++#endif  // STORAGE_LEVELDB_DB_COLUMN_FAMILY_H_
 diff --git a/db/db_impl.cc b/db/db_impl.cc
-index 1a4e459..517888d 100644
+index 1a4e459..a596f8f 100644
 --- a/db/db_impl.cc
 +++ b/db/db_impl.cc
-@@ -13,6 +13,8 @@
+@@ -13,6 +13,9 @@
  #include <vector>
  
  #include "db/builder.h"
++#include "db/column_family.h"
 +#include "db/lookup_state.h"
 +#include "db/range_del.h"
  #include "db/db_iter.h"
  #include "db/dbformat.h"
  #include "db/filename.h"
-@@ -24,6 +26,7 @@
+@@ -24,6 +27,7 @@
  #include "db/write_batch_internal.h"
  #include "leveldb/db.h"
  #include "leveldb/env.h"
@@ -172,7 +417,7 @@ index 1a4e459..517888d 100644
  #include "leveldb/status.h"
  #include "leveldb/table.h"
  #include "leveldb/table_builder.h"
-@@ -57,6 +60,7 @@ struct DBImpl::CompactionState {
+@@ -57,6 +61,7 @@ struct DBImpl::CompactionState {
      uint64_t number;
      uint64_t file_size;
      InternalKey smallest, largest;
@@ -180,7 +425,15 @@ index 1a4e459..517888d 100644
    };
  
    Output* current_output() { return &outputs[outputs.size() - 1]; }
-@@ -83,6 +87,14 @@ struct DBImpl::CompactionState {
+@@ -69,6 +74,7 @@ struct DBImpl::CompactionState {
+         total_bytes(0) {}
+ 
+   Compaction* const compaction;
++  ColumnFamily* cf = nullptr;
+ 
+   // Sequence numbers < smallest_snapshot are not significant since we
+   // will never have to service a snapshot below smallest_snapshot.
+@@ -83,6 +89,14 @@ struct DBImpl::CompactionState {
    TableBuilder* builder;
  
    uint64_t total_bytes;
@@ -195,8 +448,631 @@ index 1a4e459..517888d 100644
  };
  
  // Fix user-supplied options to be reasonable
-@@ -513,10 +525,14 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
-   Log(options_.info_log, "Level-0 table #%llu: started",
+@@ -118,6 +132,10 @@ Options SanitizeOptions(const std::string& dbname,
+   return result;
+ }
+ 
++// How many log files may pile up before the families that hold the oldest
++// one back are flushed.
++static const int kMaxLiveLogs = 3;
++
+ static int TableCacheSize(const Options& sanitized_options) {
+   // Reserve ten files or so for other uses and give the rest to TableCache.
+   return sanitized_options.max_open_files - kNumNonTableCacheFiles;
+@@ -125,29 +143,20 @@ static int TableCacheSize(const Options& sanitized_options) {
+ 
+ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+     : env_(raw_options.env),
+-      internal_comparator_(raw_options.comparator),
+-      internal_filter_policy_(raw_options.filter_policy),
+-      options_(SanitizeOptions(dbname, &internal_comparator_,
+-                               &internal_filter_policy_, raw_options)),
+-      owns_info_log_(options_.info_log != raw_options.info_log),
+-      owns_cache_(options_.block_cache != raw_options.block_cache),
++      user_comparator_(raw_options.comparator),
++      db_options_(SanitizeOptions(dbname, nullptr, nullptr, raw_options)),
++      owns_info_log_(db_options_.info_log != raw_options.info_log),
++      owns_cache_(db_options_.block_cache != raw_options.block_cache),
+       dbname_(dbname),
+-      table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+       db_lock_(nullptr),
+       shutting_down_(false),
+       background_work_finished_signal_(&mutex_),
+-      mem_(nullptr),
+-      imm_(nullptr),
+-      has_imm_(false),
+       logfile_(nullptr),
+       logfile_number_(0),
+       log_(nullptr),
+       seed_(0),
+       tmp_batch_(new WriteBatch),
+-      background_compaction_scheduled_(false),
+-      manual_compaction_(nullptr),
+-      versions_(new VersionSet(dbname_, &options_, table_cache_,
+-                               &internal_comparator_)) {}
++      background_compaction_scheduled_(false) {}
+ 
+ DBImpl::~DBImpl() {
+   // Wait for background work to finish.
+@@ -162,30 +171,58 @@ DBImpl::~DBImpl() {
+     env_->UnlockFile(db_lock_);
+   }
+ 
+-  delete versions_;
+-  if (mem_ != nullptr) mem_->Unref();
+-  if (imm_ != nullptr) imm_->Unref();
++  for (auto& entry : cfs_) {
++    ColumnFamily* cf = entry.second;
++    delete cf->versions;
++    if (cf->mem != nullptr) cf->mem->Unref();
++    if (cf->imm != nullptr) cf->imm->Unref();
++    delete cf->table_cache;
++    delete cf;
++  }
++  cfs_.clear();
++  delete default_handle_;
+   delete tmp_batch_;
+   delete log_;
+   delete logfile_;
+-  delete table_cache_;
+ 
+   if (owns_info_log_) {
+-    delete options_.info_log;
++    delete db_options_.info_log;
+   }
+   if (owns_cache_) {
+-    delete options_.block_cache;
++    delete db_options_.block_cache;
+   }
+ }
+ 
+-Status DBImpl::NewDB() {
++ColumnFamily* DBImpl::FamilyOf(ColumnFamilyHandle* handle) const {
++  if (handle == nullptr) return default_cf_;
++  return static_cast<ColumnFamilyHandleImpl*>(handle)->cf();
++}
++
++Status DBImpl::CheckFamily(ColumnFamilyHandle* handle,
++                           ColumnFamily** cf) const {
++  if (handle != nullptr) {
++    ColumnFamilyHandleImpl* impl = static_cast<ColumnFamilyHandleImpl*>(handle);
++    if (impl->db() != this) {
++      return Status::InvalidArgument("column family of another database");
++    }
++  }
++  ColumnFamily* found = FamilyOf(handle);
++  if (found == nullptr) return Status::InvalidArgument("no such column family");
++  if (found->dropped) {
++    return Status::InvalidArgument("column family dropped", found->name);
++  }
++  *cf = found;
++  return Status::OK();
++}
++
++Status DBImpl::NewDB(const std::string& dir) {
+   VersionEdit new_db;
+   new_db.SetComparatorName(user_comparator()->Name());
+   new_db.SetLogNumber(0);
+   new_db.SetNextFile(2);
+   new_db.SetLastSequence(0);
+ 
+-  const std::string manifest = DescriptorFileName(dbname_, 1);
++  const std::string manifest = DescriptorFileName(dir, 1);
+   WritableFile* file;
+   Status s = env_->NewWritableFile(manifest, &file);
+   if (!s.ok()) {
+@@ -206,7 +243,7 @@ Status DBImpl::NewDB() {
+   delete file;
+   if (s.ok()) {
+     // Make "CURRENT" file that points to the new manifest file.
+-    s = SetCurrentFile(env_, dbname_, 1);
++    s = SetCurrentFile(env_, dir, 1);
+   } else {
+     env_->RemoveFile(manifest);
+   }
+@@ -214,14 +251,32 @@ Status DBImpl::NewDB() {
+ }
+ 
+ void DBImpl::MaybeIgnoreError(Status* s) const {
+-  if (s->ok() || options_.paranoid_checks) {
++  if (s->ok() || db_options_.paranoid_checks) {
+     // No change needed
+   } else {
+-    Log(options_.info_log, "Ignoring error %s", s->ToString().c_str());
++    Log(db_options_.info_log, "Ignoring error %s", s->ToString().c_str());
+     *s = Status::OK();
+   }
+ }
+ 
++uint64_t DBImpl::OldestLiveLog() const {
++  uint64_t oldest = logfile_number_;
++  for (const auto& entry : cfs_) {
++    ColumnFamily* cf = entry.second;
++    if (cf->dropped) continue;
++    // Everything before the family's log number is in its tables; what its
++    // memtables hold starts at the log they were opened on.
++    uint64_t needed = cf->versions->LogNumber();
++    if (cf->imm != nullptr) {
++      needed = std::min(needed, cf->imm_log_number);
++    } else if (cf->mem != nullptr) {
++      needed = std::min(needed, cf->mem_log_number);
++    }
++    oldest = std::min(oldest, needed);
++  }
++  return oldest;
++}
++
+ void DBImpl::RemoveObsoleteFiles() {
+   mutex_.AssertHeld();
+ 
+@@ -231,34 +286,37 @@ void DBImpl::RemoveObsoleteFiles() {
+     return;
+   }
+ 
+-  // Make a set of all of the live files
+-  std::set<uint64_t> live = pending_outputs_;
+-  versions_->AddLiveFiles(&live);
++  const uint64_t oldest_log = OldestLiveLog();
++  std::vector<std::string> files_to_delete;  // full paths
+ 
+-  std::vector<std::string> filenames;
+-  env_->GetChildren(dbname_, &filenames);  // Ignoring errors on purpose
+-  uint64_t number;
+-  FileType type;
+-  std::vector<std::string> files_to_delete;
+-  for (std::string& filename : filenames) {
+-    if (ParseFileName(filename, &number, &type)) {
++  for (const auto& entry : cfs_) {
++    ColumnFamily* cf = entry.second;
++    // Make a set of all of the live files of this family
++    std::set<uint64_t> live = cf->pending_outputs;
++    cf->versions->AddLiveFiles(&live);
++
++    std::vector<std::string> filenames;
++    env_->GetChildren(cf->dir, &filenames);  // Ignoring errors on purpose
++    uint64_t number;
++    FileType type;
++    for (std::string& filename : filenames) {
++      if (!ParseFileName(filename, &number, &type)) continue;
+       bool keep = true;
+       switch (type) {
+         case kLogFile:
+-          keep = ((number >= versions_->LogNumber()) ||
+-                  (number == versions_->PrevLogNumber()));
++          // The logs are the database's, not the family's; only the
++          // default family's directory holds them.
++          keep = (cf->id != 0) || (number >= oldest_log);
+           break;
+         case kDescriptorFile:
+           // Keep my manifest file, and any newer incarnations'
+           // (in case there is a race that allows other incarnations)
+-          keep = (number >= versions_->ManifestFileNumber());
++          keep = (number >= cf->versions->ManifestFileNumber());
+           break;
+         case kTableFile:
+-          keep = (live.find(number) != live.end());
+-          break;
+         case kTempFile:
+           // Any temp files that are currently being written to must
+-          // be recorded in pending_outputs_, which is inserted into "live"
++          // be recorded in pending_outputs, which is inserted into "live"
+           keep = (live.find(number) != live.end());
+           break;
+         case kCurrentFile:
+@@ -269,12 +327,12 @@ void DBImpl::RemoveObsoleteFiles() {
+       }
+ 
+       if (!keep) {
+-        files_to_delete.push_back(std::move(filename));
++        files_to_delete.push_back(cf->dir + "/" + filename);
+         if (type == kTableFile) {
+-          table_cache_->Evict(number);
++          cf->table_cache->Evict(number);
+         }
+-        Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
+-            static_cast<unsigned long long>(number));
++        Log(db_options_.info_log, "Delete type=%d #%lld\n",
++            static_cast<int>(type), static_cast<unsigned long long>(number));
+       }
+     }
+   }
+@@ -284,12 +342,41 @@ void DBImpl::RemoveObsoleteFiles() {
+   // are therefore safe to delete while allowing other threads to proceed.
+   mutex_.Unlock();
+   for (const std::string& filename : files_to_delete) {
+-    env_->RemoveFile(dbname_ + "/" + filename);
++    env_->RemoveFile(filename);
+   }
+   mutex_.Lock();
+ }
+ 
+-Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
++Status DBImpl::OpenColumnFamily(ColumnFamily* cf, bool* save_manifest,
++                                VersionEdit* edit) {
++  mutex_.AssertHeld();
++  cf->table_cache =
++      new TableCache(cf->dir, cf->options, TableCacheSize(cf->options));
++  cf->versions =
++      new VersionSet(cf->dir, &cf->options, cf->table_cache, &cf->icmp);
++  Status s = cf->versions->Recover(save_manifest);
++  if (!s.ok()) return s;
++  std::set<uint64_t> expected;
++  cf->versions->AddLiveFiles(&expected);
++  std::vector<std::string> filenames;
++  s = env_->GetChildren(cf->dir, &filenames);
++  if (!s.ok()) return s;
++  uint64_t number;
++  FileType type;
++  for (size_t i = 0; i < filenames.size(); i++) {
++    if (ParseFileName(filenames[i], &number, &type)) expected.erase(number);
++  }
++  if (!expected.empty()) {
++    char buf[64];
++    std::snprintf(buf, sizeof(buf), "%d missing files of family %s; e.g.",
++                  static_cast<int>(expected.size()), cf->name.c_str());
++    return Status::Corruption(buf, TableFileName(cf->dir, *(expected.begin())));
++  }
++  return Status::OK();
++}
++
++Status DBImpl::Recover(const std::vector<ColumnFamilyDescriptor>& families,
++                       bool create_missing_families, bool* save_manifest) {
+   mutex_.AssertHeld();
+ 
+   // Ignore error from CreateDir since the creation of the DB is
+@@ -302,11 +389,12 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
+     return s;
+   }
+ 
+-  if (!env_->FileExists(CurrentFileName(dbname_))) {
+-    if (options_.create_if_missing) {
+-      Log(options_.info_log, "Creating DB %s since it was missing.",
++  const bool existed = env_->FileExists(CurrentFileName(dbname_));
++  if (!existed) {
++    if (db_options_.create_if_missing) {
++      Log(db_options_.info_log, "Creating DB %s since it was missing.",
+           dbname_.c_str());
+-      s = NewDB();
++      s = NewDB(dbname_);
+       if (!s.ok()) {
+         return s;
+       }
+@@ -315,81 +403,149 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
+           dbname_, "does not exist (create_if_missing is false)");
+     }
+   } else {
+-    if (options_.error_if_exists) {
++    if (db_options_.error_if_exists) {
+       return Status::InvalidArgument(dbname_,
+                                      "exists (error_if_exists is true)");
+     }
+   }
+ 
+-  s = versions_->Recover(save_manifest);
+-  if (!s.ok()) {
+-    return s;
++  // Which families does the database have?
++  std::vector<std::pair<uint32_t, std::string>> on_disk;
++  s = ReadFamilies(env_, dbname_, &on_disk, &next_family_id_);
++  if (!s.ok()) return s;
++
++  // What the caller asked for, by name.
++  std::map<std::string, const ColumnFamilyDescriptor*> wanted;
++  for (const ColumnFamilyDescriptor& d : families) {
++    if (!wanted.emplace(d.name, &d).second) {
++      return Status::InvalidArgument("duplicate column family", d.name);
++    }
++  }
++  const bool by_name = !families.empty();
++  if (!by_name && !on_disk.empty()) {
++    return Status::InvalidArgument(
++        dbname_, "has column families; open it with their descriptors");
++  }
++  if (by_name && wanted.find(kDefaultColumnFamilyName) == wanted.end()) {
++    return Status::InvalidArgument("the default column family must be opened");
++  }
++
++  auto options_for = [&](const std::string& name) {
++    auto it = wanted.find(name);
++    return it == wanted.end() ? db_options_ : it->second->options;
++  };
++
++  // Open the default family, then the others the database has.
++  std::vector<std::pair<uint32_t, std::string>> all;
++  all.emplace_back(0, std::string(kDefaultColumnFamilyName));
++  for (const auto& f : on_disk) all.push_back(f);
++  for (const auto& f : all) {
++    if (by_name && wanted.find(f.second) == wanted.end()) {
++      return Status::InvalidArgument("column family not opened", f.second);
++    }
+   }
++  for (const auto& f : all) {
++    Options raw = options_for(f.second);
++    raw.env = env_;
++    raw.info_log = db_options_.info_log;
++    raw.block_cache = db_options_.block_cache;
++    raw.max_open_files = db_options_.max_open_files;
++    raw.comparator = user_comparator_;
++    ColumnFamily* cf = new ColumnFamily(f.first, f.second,
++                                        ColumnFamilyDir(dbname_, f.first), raw,
++                                        user_comparator_);
++    cf->options = SanitizeOptions(cf->dir, &cf->icmp, &cf->ipolicy, raw);
++    cf->options.info_log = db_options_.info_log;
++    cf->options.block_cache = db_options_.block_cache;
++    cf->refs = 1;
++    cfs_[cf->id] = cf;
++    if (cf->id == 0) default_cf_ = cf;
++    VersionEdit edit;
++    bool cf_save = false;
++    s = OpenColumnFamily(cf, &cf_save, &edit);
++    if (!s.ok()) return s;
++    if (cf_save) *save_manifest = true;
++  }
++
++  // Create the ones that are missing, if allowed.
++  if (by_name) {
++    for (const ColumnFamilyDescriptor& d : families) {
++      bool have = false;
++      for (const auto& f : all) have = have || (f.second == d.name);
++      if (have) continue;
++      if (!create_missing_families) {
++        return Status::InvalidArgument("column family does not exist", d.name);
++      }
++      ColumnFamilyHandle* handle = nullptr;
++      s = CreateColumnFamilyLocked(d.options, d.name, &handle);
++      if (!s.ok()) return s;
++      delete handle;  // handles are handed out by Open
++    }
++  }
++
+   SequenceNumber max_sequence(0);
++  for (const auto& entry : cfs_) {
++    max_sequence = std::max(max_sequence, entry.second->versions->LastSequence());
++  }
+ 
+   // Recover from all newer log files than the ones named in the
+-  // descriptor (new log files may have been added by the previous
+-  // incarnation without registering them in the descriptor).
+-  //
+-  // Note that PrevLogNumber() is no longer used, but we pay
+-  // attention to it in case we are recovering a database
+-  // produced by an older version of leveldb.
+-  const uint64_t min_log = versions_->LogNumber();
+-  const uint64_t prev_log = versions_->PrevLogNumber();
++  // descriptors (new log files may have been added by the previous
++  // incarnation without registering them in a descriptor).
++  uint64_t min_log = default_cf_->versions->LogNumber();
++  const uint64_t prev_log = default_cf_->versions->PrevLogNumber();
++  for (const auto& entry : cfs_) {
++    min_log = std::min(min_log, entry.second->versions->LogNumber());
++  }
+   std::vector<std::string> filenames;
+   s = env_->GetChildren(dbname_, &filenames);
+   if (!s.ok()) {
+     return s;
+   }
+-  std::set<uint64_t> expected;
+-  versions_->AddLiveFiles(&expected);
+   uint64_t number;
+   FileType type;
+   std::vector<uint64_t> logs;
+   for (size_t i = 0; i < filenames.size(); i++) {
+     if (ParseFileName(filenames[i], &number, &type)) {
+-      expected.erase(number);
+       if (type == kLogFile && ((number >= min_log) || (number == prev_log)))
+         logs.push_back(number);
+     }
+   }
+-  if (!expected.empty()) {
+-    char buf[50];
+-    std::snprintf(buf, sizeof(buf), "%d missing files; e.g.",
+-                  static_cast<int>(expected.size()));
+-    return Status::Corruption(buf, TableFileName(dbname_, *(expected.begin())));
+-  }
+ 
+   // Recover in the order in which the logs were generated
+   std::sort(logs.begin(), logs.end());
+   for (size_t i = 0; i < logs.size(); i++) {
+-    s = RecoverLogFile(logs[i], (i == logs.size() - 1), save_manifest, edit,
+-                       &max_sequence);
++    s = RecoverLogFile(logs[i], (i == logs.size() - 1), &max_sequence);
+     if (!s.ok()) {
+       return s;
+     }
++    *save_manifest = true;
+ 
+     // The previous incarnation may not have written any MANIFEST
+     // records after allocating this log number.  So we manually
+-    // update the file number allocation counter in VersionSet.
+-    versions_->MarkFileNumberUsed(logs[i]);
++    // update the file number allocation counter in every family's
++    // VersionSet: they share the database's log numbers.
++    for (const auto& entry : cfs_) {
++      entry.second->versions->MarkFileNumberUsed(logs[i]);
++    }
+   }
+ 
+-  if (versions_->LastSequence() < max_sequence) {
+-    versions_->SetLastSequence(max_sequence);
++  last_sequence_ = max_sequence;
++  for (const auto& entry : cfs_) {
++    if (entry.second->versions->LastSequence() < max_sequence) {
++      entry.second->versions->SetLastSequence(max_sequence);
++    }
+   }
+ 
+   return Status::OK();
+ }
+ 
+ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
+-                              bool* save_manifest, VersionEdit* edit,
+                               SequenceNumber* max_sequence) {
+   struct LogReporter : public log::Reader::Reporter {
+     Env* env;
+     Logger* info_log;
+     const char* fname;
+-    Status* status;  // null if options_.paranoid_checks==false
++    Status* status;  // null if db_options_.paranoid_checks==false
+     void Corruption(size_t bytes, const Status& s) override {
+       Log(info_log, "%s%s: dropping %d bytes; %s",
+           (this->status == nullptr ? "(ignoring error) " : ""), fname,
+@@ -412,23 +568,32 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
+   // Create the log reader.
+   LogReporter reporter;
+   reporter.env = env_;
+-  reporter.info_log = options_.info_log;
++  reporter.info_log = db_options_.info_log;
+   reporter.fname = fname.c_str();
+-  reporter.status = (options_.paranoid_checks ? &status : nullptr);
++  reporter.status = (db_options_.paranoid_checks ? &status : nullptr);
+   // We intentionally make log::Reader do checksumming even if
+   // paranoid_checks==false so that corruptions cause entire commits
+   // to be skipped instead of propagating bad information (like overly
+   // large sequence numbers).
+   log::Reader reader(file, &reporter, true /*checksum*/, 0 /*initial_offset*/);
+-  Log(options_.info_log, "Recovering log #%llu",
++  Log(db_options_.info_log, "Recovering log #%llu",
+       (unsigned long long)log_number);
+ 
+-  // Read all the records and add to a memtable
++  // Every family whose data of this log is not in its tables yet gets a
++  // memtable; the others skip the records of this log.
++  std::map<uint32_t, MemTable*> mems;
++  std::map<uint32_t, ColumnFamily*> replaying;
++  for (const auto& entry : cfs_) {
++    ColumnFamily* cf = entry.second;
++    if (cf->dropped || cf->versions->LogNumber() > log_number) continue;
++    replaying[cf->id] = cf;
++  }
++
++  // Read all the records and add them to the memtables
+   std::string scratch;
+   Slice record;
+   WriteBatch batch;
+   int compactions = 0;
+-  MemTable* mem = nullptr;
+   while (reader.ReadRecord(&record, &scratch) && status.ok()) {
+     if (record.size() < 12) {
+       reporter.Corruption(record.size(),
+@@ -437,11 +602,14 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
+     }
+     WriteBatchInternal::SetContents(&batch, record);
+ 
+-    if (mem == nullptr) {
+-      mem = new MemTable(internal_comparator_);
+-      mem->Ref();
++    for (const auto& entry : replaying) {
++      if (mems.find(entry.first) == mems.end()) {
++        MemTable* mem = new MemTable(entry.second->icmp);
++        mem->Ref();
++        mems[entry.first] = mem;
++      }
+     }
+-    status = WriteBatchInternal::InsertInto(&batch, mem);
++    status = WriteBatchInternal::InsertInto(&batch, mems);
+     MaybeIgnoreError(&status);
+     if (!status.ok()) {
+       break;
+@@ -452,79 +620,90 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
+       *max_sequence = last_seq;
+     }
+ 
+-    if (mem->ApproximateMemoryUsage() > options_.write_buffer_size) {
+-      compactions++;
+-      *save_manifest = true;
+-      status = WriteLevel0Table(mem, edit, nullptr);
+-      mem->Unref();
+-      mem = nullptr;
+-      if (!status.ok()) {
+-        // Reflect errors immediately so that conditions like full
+-        // file-systems cause the DB::Open() to fail.
+-        break;
++    for (auto it = mems.begin(); it != mems.end();) {
++      ColumnFamily* cf = replaying[it->first];
++      if (it->second->ApproximateMemoryUsage() > cf->options.write_buffer_size) {
++        compactions++;
++        status = WriteLevel0Table(cf, it->second, &recovery_edits_[cf->id],
++                                  nullptr);
++        it->second->Unref();
++        it = mems.erase(it);
++        if (!status.ok()) break;
++      } else {
++        ++it;
+       }
+     }
++    if (!status.ok()) break;
+   }
+ 
+   delete file;
+ 
+-  // See if we should keep reusing the last log file.
+-  if (status.ok() && options_.reuse_logs && last_log && compactions == 0) {
++  // See if we should keep reusing the last log file.  Only with the default
++  // family alone: with several families the log is shared and reusing it
++  // would tangle their flush points.
++  if (status.ok() && db_options_.reuse_logs && last_log && compactions == 0 &&
++      cfs_.size() == 1 && default_cf_->mem == nullptr) {
+     assert(logfile_ == nullptr);
+     assert(log_ == nullptr);
+-    assert(mem_ == nullptr);
+     uint64_t lfile_size;
+     if (env_->GetFileSize(fname, &lfile_size).ok() &&
+         env_->NewAppendableFile(fname, &logfile_).ok()) {
+-      Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
++      Log(db_options_.info_log, "Reusing old log %s \n", fname.c_str());
+       log_ = new log::Writer(logfile_, lfile_size);
+       logfile_number_ = log_number;
+-      if (mem != nullptr) {
+-        mem_ = mem;
+-        mem = nullptr;
++      auto it = mems.find(0);
++      if (it != mems.end()) {
++        default_cf_->mem = it->second;
++        mems.erase(it);
+       } else {
+-        // mem can be nullptr if lognum exists but was empty.
+-        mem_ = new MemTable(internal_comparator_);
+-        mem_->Ref();
++        // the log existed but was empty
++        default_cf_->mem = new MemTable(default_cf_->icmp);
++        default_cf_->mem->Ref();
+       }
++      default_cf_->mem_log_number = log_number;
++      return status;
+     }
+   }
+ 
+-  if (mem != nullptr) {
+-    // mem did not get reused; compact it.
++  for (auto& entry : mems) {
++    ColumnFamily* cf = replaying[entry.first];
+     if (status.ok()) {
+-      *save_manifest = true;
+-      status = WriteLevel0Table(mem, edit, nullptr);
++      status = WriteLevel0Table(cf, entry.second, &recovery_edits_[cf->id],
++                                nullptr);
+     }
+-    mem->Unref();
++    entry.second->Unref();
+   }
+ 
+   return status;
+ }
+ 
+-Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
+-                                Version* base) {
++Status DBImpl::WriteLevel0Table(ColumnFamily* cf, MemTable* mem,
++                                VersionEdit* edit, Version* base) {
+   mutex_.AssertHeld();
+   const uint64_t start_micros = env_->NowMicros();
+   FileMetaData meta;
+-  meta.number = versions_->NewFileNumber();
+-  pending_outputs_.insert(meta.number);
++  meta.number = cf->versions->NewFileNumber();
++  cf->pending_outputs.insert(meta.number);
+   Iterator* iter = mem->NewIterator();
+-  Log(options_.info_log, "Level-0 table #%llu: started",
++  Log(db_options_.info_log, "Level-0 table #%llu: started",
        (unsigned long long)meta.number);
  
 +  std::vector<RangeTombstone> tombstones;
@@ -206,12 +1082,22 @@ index 1a4e459..517888d 100644
    {
      mutex_.Unlock();
 -    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
-+    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
++    s = BuildTable(cf->dir, env_, cf->options, cf->table_cache, iter, &meta,
 +                   tombstones);
      mutex_.Lock();
    }
  
-@@ -536,7 +552,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
+-  Log(options_.info_log, "Level-0 table #%llu: %lld bytes %s",
++  Log(db_options_.info_log, "Level-0 table #%llu: %lld bytes %s",
+       (unsigned long long)meta.number, (unsigned long long)meta.file_size,
+       s.ToString().c_str());
+   delete iter;
+-  pending_outputs_.erase(meta.number);
++  cf->pending_outputs.erase(meta.number);
+ 
+   // Note that if file_size is zero, the file has been deleted and
+   // should not be added to the manifest.
+@@ -536,25 +715,25 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
        level = base->PickLevelForMemTableOutput(min_user_key, max_user_key);
      }
      edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
@@ -220,32 +1106,323 @@ index 1a4e459..517888d 100644
    }
  
    CompactionStats stats;
-@@ -735,7 +751,7 @@ void DBImpl::BackgroundCompaction() {
+   stats.micros = env_->NowMicros() - start_micros;
+   stats.bytes_written = meta.file_size;
+-  stats_[level].Add(stats);
++  cf->stats[level].Add(stats);
+   return s;
+ }
+ 
+-void DBImpl::CompactMemTable() {
++void DBImpl::CompactMemTable(ColumnFamily* cf) {
+   mutex_.AssertHeld();
+-  assert(imm_ != nullptr);
++  assert(cf->imm != nullptr);
+ 
+   // Save the contents of the memtable as a new Table
+   VersionEdit edit;
+-  Version* base = versions_->current();
++  Version* base = cf->versions->current();
+   base->Ref();
+-  Status s = WriteLevel0Table(imm_, &edit, base);
++  Status s = WriteLevel0Table(cf, cf->imm, &edit, base);
+   base->Unref();
+ 
+   if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
+@@ -564,15 +743,22 @@ void DBImpl::CompactMemTable() {
+   // Replace immutable memtable with the generated Table
+   if (s.ok()) {
+     edit.SetPrevLogNumber(0);
+-    edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
+-    s = versions_->LogAndApply(&edit, &mutex_);
++    // Every log below the one the current memtable writes to is now in
++    // this family's tables.
++    edit.SetLogNumber(cf->mem_log_number);
++    s = cf->versions->LogAndApply(&edit, &mutex_);
+   }
+ 
+   if (s.ok()) {
+     // Commit to the new state
+-    imm_->Unref();
+-    imm_ = nullptr;
+-    has_imm_.store(false, std::memory_order_release);
++    cf->imm->Unref();
++    cf->imm = nullptr;
++    cf->has_imm.store(false, std::memory_order_release);
++    bool any = false;
++    for (const auto& entry : cfs_) {
++      any = any || (entry.second->imm != nullptr);
++    }
++    pending_flush_.store(any, std::memory_order_release);
+     RemoveObsoleteFiles();
+   } else {
+     RecordBackgroundError(s);
+@@ -580,10 +766,17 @@ void DBImpl::CompactMemTable() {
+ }
+ 
+ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
++  CompactRange(nullptr, begin, end);
++}
++
++void DBImpl::CompactRange(ColumnFamilyHandle* handle, const Slice* begin,
++                          const Slice* end) {
++  ColumnFamily* cf = nullptr;
++  if (!CheckFamily(handle, &cf).ok()) return;
+   int max_level_with_files = 1;
+   {
+     MutexLock l(&mutex_);
+-    Version* base = versions_->current();
++    Version* base = cf->versions->current();
+     for (int level = 1; level < config::kNumLevels; level++) {
+       if (base->OverlapInLevel(level, begin, end)) {
+         max_level_with_files = level;
+@@ -598,6 +791,7 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
+ 
+ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
+                                const Slice* end) {
++  ColumnFamily* cf = default_cf_;
+   assert(level >= 0);
+   assert(level + 1 < config::kNumLevels);
+ 
+@@ -622,29 +816,30 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
+   MutexLock l(&mutex_);
+   while (!manual.done && !shutting_down_.load(std::memory_order_acquire) &&
+          bg_error_.ok()) {
+-    if (manual_compaction_ == nullptr) {  // Idle
+-      manual_compaction_ = &manual;
++    if (cf->manual == nullptr) {  // Idle
++      cf->manual = &manual;
+       MaybeScheduleCompaction();
+     } else {  // Running either my compaction or another compaction.
+       background_work_finished_signal_.Wait();
+     }
+   }
+-  if (manual_compaction_ == &manual) {
++  if (cf->manual == &manual) {
+     // Cancel my manual compaction since we aborted early for some reason.
+-    manual_compaction_ = nullptr;
++    cf->manual = nullptr;
+   }
+ }
+ 
+ Status DBImpl::TEST_CompactMemTable() {
++  ColumnFamily* cf = default_cf_;
+   // nullptr batch means just wait for earlier writes to be done
+   Status s = Write(WriteOptions(), nullptr);
+   if (s.ok()) {
+     // Wait until the compaction completes
+     MutexLock l(&mutex_);
+-    while (imm_ != nullptr && bg_error_.ok()) {
++    while (cf->imm != nullptr && bg_error_.ok()) {
+       background_work_finished_signal_.Wait();
+     }
+-    if (imm_ != nullptr) {
++    if (cf->imm != nullptr) {
+       s = bg_error_;
+     }
+   }
+@@ -659,6 +854,18 @@ void DBImpl::RecordBackgroundError(const Status& s) {
+   }
+ }
+ 
++bool DBImpl::NeedsBackgroundWork() const {
++  for (const auto& entry : cfs_) {
++    ColumnFamily* cf = entry.second;
++    if (cf->dropped) continue;
++    if (cf->imm != nullptr || cf->manual != nullptr ||
++        cf->versions->NeedsCompaction()) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ void DBImpl::MaybeScheduleCompaction() {
+   mutex_.AssertHeld();
+   if (background_compaction_scheduled_) {
+@@ -667,8 +874,7 @@ void DBImpl::MaybeScheduleCompaction() {
+     // DB is being deleted; no more background compactions
+   } else if (!bg_error_.ok()) {
+     // Already got an error; no more changes
+-  } else if (imm_ == nullptr && manual_compaction_ == nullptr &&
+-             !versions_->NeedsCompaction()) {
++  } else if (!NeedsBackgroundWork()) {
+     // No work to be done
+   } else {
+     background_compaction_scheduled_ = true;
+@@ -702,28 +908,58 @@ void DBImpl::BackgroundCall() {
+ void DBImpl::BackgroundCompaction() {
+   mutex_.AssertHeld();
+ 
+-  if (imm_ != nullptr) {
+-    CompactMemTable();
++  // Flushing a memtable comes first, then a manual compaction, then
++  // whichever family most needs one.  Families are taken in id order, so
++  // no family can starve another for long.
++  ColumnFamily* cf = nullptr;
++  for (const auto& entry : cfs_) {
++    if (!entry.second->dropped && entry.second->imm != nullptr) {
++      cf = entry.second;
++      break;
++    }
++  }
++  if (cf != nullptr) {
++    CompactMemTable(cf);
+     return;
+   }
++  for (const auto& entry : cfs_) {
++    if (!entry.second->dropped && entry.second->manual != nullptr) {
++      cf = entry.second;
++      break;
++    }
++  }
++  if (cf == nullptr) {
++    double best = -1;
++    for (const auto& entry : cfs_) {
++      ColumnFamily* candidate = entry.second;
++      if (candidate->dropped || !candidate->versions->NeedsCompaction()) continue;
++      const double score = candidate->versions->current()->CompactionScore();
++      if (cf == nullptr || score > best) {
++        cf = candidate;
++        best = score;
++      }
++    }
++  }
++  if (cf == nullptr) return;
+ 
+   Compaction* c;
+-  bool is_manual = (manual_compaction_ != nullptr);
++  bool is_manual = (cf->manual != nullptr);
+   InternalKey manual_end;
+   if (is_manual) {
+-    ManualCompaction* m = manual_compaction_;
+-    c = versions_->CompactRange(m->level, m->begin, m->end);
++    ManualCompaction* m = cf->manual;
++    c = cf->versions->CompactRange(m->level, m->begin, m->end);
+     m->done = (c == nullptr);
+     if (c != nullptr) {
+       manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
+     }
+-    Log(options_.info_log,
+-        "Manual compaction at level-%d from %s .. %s; will stop at %s\n",
+-        m->level, (m->begin ? m->begin->DebugString().c_str() : "(begin)"),
++    Log(db_options_.info_log,
++        "Manual compaction of %s at level-%d from %s .. %s; will stop at %s\n",
++        cf->name.c_str(), m->level,
++        (m->begin ? m->begin->DebugString().c_str() : "(begin)"),
+         (m->end ? m->end->DebugString().c_str() : "(end)"),
+         (m->done ? "(end)" : manual_end.DebugString().c_str()));
+   } else {
+-    c = versions_->PickCompaction();
++    c = cf->versions->PickCompaction();
+   }
+ 
+   Status status;
+@@ -735,18 +971,19 @@ void DBImpl::BackgroundCompaction() {
      FileMetaData* f = c->input(0, 0);
      c->edit()->RemoveFile(c->level(), f->number);
      c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
 -                       f->largest);
+-    status = versions_->LogAndApply(c->edit(), &mutex_);
 +                       f->largest, f->has_range_dels);
-     status = versions_->LogAndApply(c->edit(), &mutex_);
++    status = cf->versions->LogAndApply(c->edit(), &mutex_);
      if (!status.ok()) {
        RecordBackgroundError(status);
-@@ -823,7 +839,8 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
+     }
+     VersionSet::LevelSummaryStorage tmp;
+-    Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
++    Log(db_options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
+         static_cast<unsigned long long>(f->number), c->level() + 1,
+         static_cast<unsigned long long>(f->file_size),
+-        status.ToString().c_str(), versions_->LevelSummary(&tmp));
++        status.ToString().c_str(), cf->versions->LevelSummary(&tmp));
+   } else {
+     CompactionState* compact = new CompactionState(c);
++    compact->cf = cf;
+     status = DoCompactionWork(compact);
+     if (!status.ok()) {
+       RecordBackgroundError(status);
+@@ -762,11 +999,11 @@ void DBImpl::BackgroundCompaction() {
+   } else if (shutting_down_.load(std::memory_order_acquire)) {
+     // Ignore compaction errors found during shutting down
+   } else {
+-    Log(options_.info_log, "Compaction error: %s", status.ToString().c_str());
++    Log(db_options_.info_log, "Compaction error: %s", status.ToString().c_str());
+   }
+ 
+   if (is_manual) {
+-    ManualCompaction* m = manual_compaction_;
++    ManualCompaction* m = cf->manual;
+     if (!status.ok()) {
+       m->done = true;
+     }
+@@ -776,11 +1013,12 @@ void DBImpl::BackgroundCompaction() {
+       m->tmp_storage = manual_end;
+       m->begin = &m->tmp_storage;
+     }
+-    manual_compaction_ = nullptr;
++    cf->manual = nullptr;
+   }
+ }
+ 
+ void DBImpl::CleanupCompaction(CompactionState* compact) {
++  ColumnFamily* cf = compact->cf;
+   mutex_.AssertHeld();
+   if (compact->builder != nullptr) {
+     // May happen if we get a shutdown call in the middle of compaction
+@@ -792,19 +1030,20 @@ void DBImpl::CleanupCompaction(CompactionState* compact) {
+   delete compact->outfile;
+   for (size_t i = 0; i < compact->outputs.size(); i++) {
+     const CompactionState::Output& out = compact->outputs[i];
+-    pending_outputs_.erase(out.number);
++    cf->pending_outputs.erase(out.number);
+   }
+   delete compact;
+ }
+ 
+ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
++  ColumnFamily* cf = compact->cf;
+   assert(compact != nullptr);
+   assert(compact->builder == nullptr);
+   uint64_t file_number;
+   {
+     mutex_.Lock();
+-    file_number = versions_->NewFileNumber();
+-    pending_outputs_.insert(file_number);
++    file_number = cf->versions->NewFileNumber();
++    cf->pending_outputs.insert(file_number);
+     CompactionState::Output out;
+     out.number = file_number;
+     out.smallest.Clear();
+@@ -814,16 +1053,18 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
+   }
+ 
+   // Make the output file
+-  std::string fname = TableFileName(dbname_, file_number);
++  std::string fname = TableFileName(cf->dir, file_number);
+   Status s = env_->NewWritableFile(fname, &compact->outfile);
+   if (s.ok()) {
+-    compact->builder = new TableBuilder(options_, compact->outfile);
++    compact->builder = new TableBuilder(cf->options, compact->outfile);
+   }
+   return s;
  }
  
  Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 -                                          Iterator* input) {
 +                                          Iterator* input,
 +                                          const Slice* upper_cut) {
++  ColumnFamily* cf = compact->cf;
    assert(compact != nullptr);
    assert(compact->outfile != nullptr);
    assert(compact->builder != nullptr);
-@@ -831,6 +848,37 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
+@@ -831,6 +1072,37 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
    const uint64_t output_number = compact->current_output()->number;
    assert(output_number != 0);
  
 +  // The tombstones this file carries: those parts of them in
 +  // [lower_cut, upper_cut).
-+  const Comparator* ucmp = user_comparator();
++  const Comparator* ucmp = cf->user_comparator();
 +  std::vector<RangeTombstone> mine;
 +  for (const RangeTombstone& t : compact->tombstones) {
 +    Slice b(t.begin), e(t.end);
@@ -264,7 +1441,7 @@ index 1a4e459..517888d 100644
 +    EncodeRangeTombstones(mine, &block);
 +    compact->builder->SetRangeDeletionBlock(block);
 +    CompactionState::Output* out = compact->current_output();
-+    AddTombstoneBounds(internal_comparator_, mine,
++    AddTombstoneBounds(cf->icmp, mine,
 +                       compact->builder->NumEntries() > 0, &out->smallest,
 +                       &out->largest);
 +    out->has_range_dels = true;
@@ -277,7 +1454,32 @@ index 1a4e459..517888d 100644
    // Check for iterator errors
    Status s = input->status();
    const uint64_t current_entries = compact->builder->NumEntries();
-@@ -884,7 +932,8 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
+@@ -858,11 +1130,11 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
+   if (s.ok() && current_entries > 0) {
+     // Verify that the table is usable
+     Iterator* iter =
+-        table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
++        cf->table_cache->NewIterator(ReadOptions(), output_number, current_bytes);
+     s = iter->status();
+     delete iter;
+     if (s.ok()) {
+-      Log(options_.info_log, "Generated table #%llu@%d: %lld keys, %lld bytes",
++      Log(db_options_.info_log, "Generated table #%llu@%d: %lld keys, %lld bytes",
+           (unsigned long long)output_number, compact->compaction->level(),
+           (unsigned long long)current_entries,
+           (unsigned long long)current_bytes);
+@@ -872,8 +1144,9 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
+ }
+ 
+ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
++  ColumnFamily* cf = compact->cf;
+   mutex_.AssertHeld();
+-  Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
++  Log(db_options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
+       compact->compaction->num_input_files(0), compact->compaction->level(),
+       compact->compaction->num_input_files(1), compact->compaction->level() + 1,
+       static_cast<long long>(compact->total_bytes));
+@@ -884,140 +1157,275 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
    for (size_t i = 0; i < compact->outputs.size(); i++) {
      const CompactionState::Output& out = compact->outputs[i];
      compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
@@ -285,10 +1487,24 @@ index 1a4e459..517888d 100644
 +                                         out.smallest, out.largest,
 +                                         out.has_range_dels);
    }
-   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+-  return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
++  return cf->versions->LogAndApply(compact->compaction->edit(), &mutex_);
  }
-@@ -901,6 +950,11 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
-   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
+ 
+ Status DBImpl::DoCompactionWork(CompactionState* compact) {
++  ColumnFamily* cf = compact->cf;
+   const uint64_t start_micros = env_->NowMicros();
+-  int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
++  int64_t imm_micros = 0;  // Micros spent flushing memtables
+ 
+-  Log(options_.info_log, "Compacting %d@%d + %d@%d files",
++  Log(db_options_.info_log, "Compacting %d@%d + %d@%d files",
+       compact->compaction->num_input_files(0), compact->compaction->level(),
+       compact->compaction->num_input_files(1),
+       compact->compaction->level() + 1);
+ 
+-  assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
++  assert(cf->versions->NumLevelFiles(compact->compaction->level()) > 0);
    assert(compact->builder == nullptr);
    assert(compact->outfile == nullptr);
 +  // Every live snapshot, oldest first.  Entries between two consecutive
@@ -297,14 +1513,20 @@ index 1a4e459..517888d 100644
 +  std::vector<SequenceNumber> snapshots;
 +  snapshots_.GetAll(&snapshots);
    if (snapshots_.empty()) {
-     compact->smallest_snapshot = versions_->LastSequence();
+-    compact->smallest_snapshot = versions_->LastSequence();
++    compact->smallest_snapshot = cf->versions->LastSequence();
    } else {
-@@ -912,13 +966,188 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
+     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
+   }
+ 
+-  Iterator* input = versions_->MakeInputIterator(compact->compaction);
++  Iterator* input = cf->versions->MakeInputIterator(compact->compaction);
+ 
    // Release mutex while we're actually doing the compaction work
    mutex_.Unlock();
  
 -  input->SeekToFirst();
-+  const Comparator* ucmp = user_comparator();
++  const Comparator* ucmp = cf->user_comparator();
    Status status;
 +
 +  // The range tombstones of the input files.  Those that nothing below the
@@ -315,7 +1537,7 @@ index 1a4e459..517888d 100644
 +    for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
 +      FileMetaData* f = compact->compaction->input(which, i);
 +      if (!f->has_range_dels) continue;
-+      status = table_cache_->GetRangeTombstones(f->number, f->file_size,
++      status = cf->table_cache->GetRangeTombstones(f->number, f->file_size,
 +                                                &input_tombstones);
 +      if (!status.ok()) break;
 +    }
@@ -341,7 +1563,7 @@ index 1a4e459..517888d 100644
 +    return std::lower_bound(snapshots.begin(), snapshots.end(), seq) -
 +           snapshots.begin();
 +  };
-+  const MergeOperator* merge_op = options_.merge_operator;
++  const MergeOperator* merge_op = cf->options.merge_operator;
 +
 +  struct Entry {
 +    SequenceNumber seq;
@@ -491,9 +1713,23 @@ index 1a4e459..517888d 100644
 +  while (status.ok() && input->Valid() &&
 +         !shutting_down_.load(std::memory_order_acquire)) {
      // Prioritize immutable compaction work
-     if (has_imm_.load(std::memory_order_relaxed)) {
+-    if (has_imm_.load(std::memory_order_relaxed)) {
++    if (pending_flush_.load(std::memory_order_relaxed)) {
        const uint64_t imm_start = env_->NowMicros();
-@@ -933,91 +1162,42 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
+       mutex_.Lock();
+-      if (imm_ != nullptr) {
+-        CompactMemTable();
+-        // Wake up MakeRoomForWrite() if necessary.
+-        background_work_finished_signal_.SignalAll();
++      for (const auto& entry : cfs_) {
++        if (!entry.second->dropped && entry.second->imm != nullptr) {
++          CompactMemTable(entry.second);
++        }
+       }
++      // Wake up MakeRoomForWrite() if necessary.
++      background_work_finished_signal_.SignalAll();
+       mutex_.Unlock();
+       imm_micros += (env_->NowMicros() - imm_start);
      }
  
      Slice key = input->key();
@@ -524,7 +1760,9 @@ index 1a4e459..517888d 100644
 -        current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
 -        has_current_user_key = true;
 -        last_sequence_for_key = kMaxSequenceNumber;
--      }
++      if (!group.empty() && ucmp->Compare(ikey.user_key, group_key) != 0) {
++        status = flush_group();
+       }
 -
 -      if (last_sequence_for_key <= compact->smallest_snapshot) {
 -        // Hidden by an newer entry for same user key
@@ -561,9 +1799,7 @@ index 1a4e459..517888d 100644
 -        if (!status.ok()) {
 -          break;
 -        }
-+      if (!group.empty() && ucmp->Compare(ikey.user_key, group_key) != 0) {
-+        status = flush_group();
-       }
+-      }
 -      if (compact->builder->NumEntries() == 0) {
 -        compact->current_output()->smallest.DecodeFrom(key);
 -      }
@@ -609,19 +1845,38 @@ index 1a4e459..517888d 100644
    }
    if (status.ok()) {
      status = input->status();
-@@ -1074,11 +1254,51 @@ static void CleanupIteratorState(void* arg1, void* arg2) {
+@@ -1037,7 +1445,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
+   }
+ 
+   mutex_.Lock();
+-  stats_[compact->compaction->level() + 1].Add(stats);
++  cf->stats[compact->compaction->level() + 1].Add(stats);
+ 
+   if (status.ok()) {
+     status = InstallCompactionResults(compact);
+@@ -1046,7 +1454,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
+     RecordBackgroundError(status);
+   }
+   VersionSet::LevelSummaryStorage tmp;
+-  Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
++  Log(db_options_.info_log, "compacted to: %s", cf->versions->LevelSummary(&tmp));
+   return status;
+ }
+ 
+@@ -1074,26 +1482,87 @@ static void CleanupIteratorState(void* arg1, void* arg2) {
  
  }  // anonymous namespace
  
 -Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
 -                                      SequenceNumber* latest_snapshot,
 -                                      uint32_t* seed) {
-+std::shared_ptr<const RangeDelView> DBImpl::RangeDelsLocked(MemTable* mem,
++std::shared_ptr<const RangeDelView> DBImpl::RangeDelsLocked(ColumnFamily* cf,
++                                                            MemTable* mem,
 +                                                            MemTable* imm,
 +                                                            Version* v,
 +                                                            Status* s) {
 +  mutex_.AssertHeld();
-+  RangeDelCache& c = range_del_cache_;
++  RangeDelCache& c = cf->rd_cache;
 +  if (c.version_id != v->id()) {
 +    c.version_id = v->id();
 +    c.version_has_range_dels = v->HasRangeDels();
@@ -633,7 +1888,7 @@ index 1a4e459..517888d 100644
 +        c.version_id = 0;
 +        return nullptr;
 +      }
-+      RangeDelIndex* index = new RangeDelIndex(user_comparator());
++      RangeDelIndex* index = new RangeDelIndex(cf->user_comparator());
 +      for (const RangeTombstone& t : all) index->Add(t);
 +      index->Finish();
 +      c.index.reset(index);
@@ -647,14 +1902,16 @@ index 1a4e459..517888d 100644
 +}
 +
 +Iterator* DBImpl::NewInternalIterator(
-+    const ReadOptions& options, SequenceNumber* latest_snapshot,
-+    uint32_t* seed, std::shared_ptr<const RangeDelView>* range_dels) {
++    const ReadOptions& options, ColumnFamily* cf,
++    SequenceNumber* latest_snapshot, uint32_t* seed,
++    std::shared_ptr<const RangeDelView>* range_dels) {
    mutex_.Lock();
-   *latest_snapshot = versions_->LastSequence();
+-  *latest_snapshot = versions_->LastSequence();
++  *latest_snapshot = last_sequence_;
 +  std::shared_ptr<const RangeDelView> view;
 +  if (range_dels != nullptr) {
 +    Status s;
-+    view = RangeDelsLocked(mem_, imm_, versions_->current(), &s);
++    view = RangeDelsLocked(cf, cf->mem, cf->imm, cf->versions->current(), &s);
 +    if (!s.ok()) {
 +      mutex_.Unlock();
 +      return NewErrorIterator(s);
@@ -664,13 +1921,19 @@ index 1a4e459..517888d 100644
  
    // Collect together all needed child iterators
    std::vector<Iterator*> list;
-@@ -1088,7 +1308,26 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
-     list.push_back(imm_->NewIterator());
-     imm_->Ref();
-   }
--  versions_->current()->AddIterators(options, &list);
+-  list.push_back(mem_->NewIterator());
+-  mem_->Ref();
+-  if (imm_ != nullptr) {
+-    list.push_back(imm_->NewIterator());
+-    imm_->Ref();
++  list.push_back(cf->mem->NewIterator());
++  cf->mem->Ref();
++  if (cf->imm != nullptr) {
++    list.push_back(cf->imm->NewIterator());
++    cf->imm->Ref();
++  }
 +  if (view == nullptr) {
-+    versions_->current()->AddIterators(options, &list);
++    cf->versions->current()->AddIterators(options, &list);
 +  } else {
 +    // Each older layer skips what a newer layer's tombstone hides.
 +    const SequenceNumber snapshot =
@@ -678,26 +1941,78 @@ index 1a4e459..517888d 100644
 +            ? static_cast<const SnapshotImpl*>(options.snapshot)
 +                  ->sequence_number()
 +            : *latest_snapshot;
-+    if (imm_ != nullptr) {
-+      list.back() = NewRangeDelSkippingIterator(list.back(), &internal_comparator_,
++    if (cf->imm != nullptr) {
++      list.back() = NewRangeDelSkippingIterator(list.back(), &cf->icmp,
 +                                                view, kLayerImm, snapshot);
 +    }
 +    std::vector<std::pair<Iterator*, int>> layers;
-+    versions_->current()->AddLayerIterators(options, &layers);
++    cf->versions->current()->AddLayerIterators(options, &layers);
 +    for (auto& p : layers) {
-+      list.push_back(NewRangeDelSkippingIterator(p.first, &internal_comparator_,
++      list.push_back(NewRangeDelSkippingIterator(p.first, &cf->icmp,
 +                                                 view, p.second, snapshot));
 +    }
-+  }
+   }
+-  versions_->current()->AddIterators(options, &list);
    Iterator* internal_iter =
-       NewMergingIterator(&internal_comparator_, &list[0], list.size());
-   versions_->current()->Ref();
-@@ -1133,20 +1372,37 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
+-      NewMergingIterator(&internal_comparator_, &list[0], list.size());
+-  versions_->current()->Ref();
++      NewMergingIterator(&cf->icmp, &list[0], list.size());
++  cf->versions->current()->Ref();
+ 
+-  IterState* cleanup = new IterState(&mutex_, mem_, imm_, versions_->current());
++  IterState* cleanup = new IterState(&mutex_, cf->mem, cf->imm, cf->versions->current());
+   internal_iter->RegisterCleanup(CleanupIteratorState, cleanup, nullptr);
+ 
+   *seed = ++seed_;
+@@ -1104,49 +1573,73 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
+ Iterator* DBImpl::TEST_NewInternalIterator() {
+   SequenceNumber ignored;
+   uint32_t ignored_seed;
+-  return NewInternalIterator(ReadOptions(), &ignored, &ignored_seed);
++  return NewInternalIterator(ReadOptions(), default_cf_, &ignored, &ignored_seed);
+ }
+ 
+ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
+   MutexLock l(&mutex_);
+-  return versions_->MaxNextLevelOverlappingBytes();
++  return default_cf_->versions->MaxNextLevelOverlappingBytes();
+ }
+ 
+ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
+                    std::string* value) {
+-  Status s;
++  return Get(options, nullptr, key, value);
++}
++
++Status DBImpl::Get(const ReadOptions& options, ColumnFamilyHandle* handle,
++                   const Slice& key, std::string* value) {
+   MutexLock l(&mutex_);
++  ColumnFamily* cf = nullptr;
++  Status s = CheckFamily(handle, &cf);
++  if (!s.ok()) return s;
+   SequenceNumber snapshot;
+   if (options.snapshot != nullptr) {
+     snapshot =
+         static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number();
+   } else {
+-    snapshot = versions_->LastSequence();
++    snapshot = last_sequence_;
+   }
+ 
+-  MemTable* mem = mem_;
+-  MemTable* imm = imm_;
+-  Version* current = versions_->current();
++  MemTable* mem = cf->mem;
++  MemTable* imm = cf->imm;
++  Version* current = cf->versions->current();
+   mem->Ref();
+   if (imm != nullptr) imm->Ref();
+   current->Ref();
  
    bool have_stat_update = false;
    Version::GetStats stats;
 +  std::shared_ptr<const RangeDelView> range_dels =
-+      RangeDelsLocked(mem, imm, current, &s);
++      RangeDelsLocked(cf, mem, imm, current, &s);
  
    // Unlock while reading from files and memtables
 -  {
@@ -706,7 +2021,7 @@ index 1a4e459..517888d 100644
      // First look in the memtable, then in the immutable memtable (if any).
      LookupKey lkey(key, snapshot);
 -    if (mem->Get(lkey, value, &s)) {
-+    LookupState lookup(key, snapshot, options_.merge_operator,
++    LookupState lookup(key, snapshot, cf->options.merge_operator,
 +                       range_dels.get(), value);
 +    // A tombstone of a newer layer hides everything below it.
 +    auto hidden_below = [&](int layer) {
@@ -734,50 +2049,412 @@ index 1a4e459..517888d 100644
      mutex_.Lock();
    }
  
-@@ -1162,13 +1418,15 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
+@@ -1160,27 +1653,37 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
+ }
+ 
  Iterator* DBImpl::NewIterator(const ReadOptions& options) {
++  return NewIterator(options, nullptr);
++}
++
++Iterator* DBImpl::NewIterator(const ReadOptions& options,
++                              ColumnFamilyHandle* handle) {
++  ColumnFamily* cf = nullptr;
++  Status fs = CheckFamily(handle, &cf);
++  if (!fs.ok()) return NewErrorIterator(fs);
    SequenceNumber latest_snapshot;
    uint32_t seed;
 -  Iterator* iter = NewInternalIterator(options, &latest_snapshot, &seed);
+-  return NewDBIterator(this, user_comparator(), iter,
 +  std::shared_ptr<const RangeDelView> range_dels;
 +  Iterator* iter =
-+      NewInternalIterator(options, &latest_snapshot, &seed, &range_dels);
-   return NewDBIterator(this, user_comparator(), iter,
++      NewInternalIterator(options, cf, &latest_snapshot, &seed, &range_dels);
++  return NewDBIterator(this, cf->user_comparator(), iter,
                         (options.snapshot != nullptr
                              ? static_cast<const SnapshotImpl*>(options.snapshot)
                                    ->sequence_number()
                              : latest_snapshot),
 -                       seed);
-+                       seed, options_.merge_operator, std::move(range_dels));
++                       seed, cf->options.merge_operator, std::move(range_dels));
  }
  
  void DBImpl::RecordReadSample(Slice key) {
-@@ -1197,7 +1455,24 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
+   MutexLock l(&mutex_);
+-  if (versions_->current()->RecordReadSample(key)) {
++  if (default_cf_->versions->current()->RecordReadSample(key)) {
+     MaybeScheduleCompaction();
+   }
+ }
+ 
+ const Snapshot* DBImpl::GetSnapshot() {
+   MutexLock l(&mutex_);
+-  return snapshots_.New(versions_->LastSequence());
++  return snapshots_.New(last_sequence_);
+ }
+ 
+ void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
+@@ -1193,11 +1696,69 @@ Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
+   return DB::Put(o, key, val);
+ }
+ 
++Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* family,
++                   const Slice& key, const Slice& val) {
++  return DB::Put(o, family, key, val);
++}
++
+ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
    return DB::Delete(options, key);
  }
  
++Status DBImpl::Delete(const WriteOptions& options, ColumnFamilyHandle* family,
++                      const Slice& key) {
++  return DB::Delete(options, family, key);
++}
++
 +Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin,
 +                           const Slice& end) {
 +  return DB::DeleteRange(options, begin, end);
 +}
 +
++Status DBImpl::DeleteRange(const WriteOptions& options,
++                           ColumnFamilyHandle* family, const Slice& begin,
++                           const Slice& end) {
++  return DB::DeleteRange(options, family, begin, end);
++}
++
 +Status DBImpl::Merge(const WriteOptions& options, const Slice& key,
 +                     const Slice& value) {
-+  if (options_.merge_operator == nullptr) {
-+    return Status::InvalidArgument("no merge_operator configured");
++  return Merge(options, nullptr, key, value);
++}
++
++Status DBImpl::Merge(const WriteOptions& options, ColumnFamilyHandle* family,
++                     const Slice& key, const Slice& value) {
++  {
++    MutexLock l(&mutex_);
++    ColumnFamily* cf = nullptr;
++    Status s = CheckFamily(family, &cf);
++    if (!s.ok()) return s;
++    if (cf->options.merge_operator == nullptr) {
++      return Status::InvalidArgument("no merge_operator configured", cf->name);
++    }
 +  }
-+  return DB::Merge(options, key, value);
++  return DB::Merge(options, family, key, value);
 +}
 +
  Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
-+  if (updates != nullptr && options_.merge_operator == nullptr &&
-+      WriteBatchInternal::HasMerge(updates)) {
-+    return Status::InvalidArgument("no merge_operator configured");
++  // Which families does this batch touch, and do they all take operands?
++  std::set<uint32_t> families, merges;
++  if (updates != nullptr) {
++    WriteBatchInternal::Scan(updates, &families, &merges);
++    MutexLock l(&mutex_);
++    for (uint32_t id : families) {
++      auto it = cfs_.find(id);
++      if (it == cfs_.end() || it->second->dropped) {
++        return Status::InvalidArgument("no such column family",
++                                       std::to_string(id));
++      }
++      if (merges.count(id) && it->second->options.merge_operator == nullptr) {
++        return Status::InvalidArgument("no merge_operator configured",
++                                       it->second->name);
++      }
++    }
 +  }
++
    Writer w(&mutex_);
    w.batch = updates;
    w.sync = options.sync;
-@@ -1478,6 +1753,20 @@ Status DB::Delete(const WriteOptions& opt, const Slice& key) {
+@@ -1213,18 +1774,24 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+   }
+ 
+   // May temporarily unlock and wait.
+-  Status status = MakeRoomForWrite(updates == nullptr);
+-  uint64_t last_sequence = versions_->LastSequence();
++  Status status = MakeRoomForWrite(families, updates == nullptr);
++  uint64_t last_sequence = last_sequence_;
+   Writer* last_writer = &w;
+   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
+     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
+     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
+     last_sequence += WriteBatchInternal::Count(write_batch);
+ 
+-    // Add to log and apply to memtable.  We can release the lock
++    // Every live family's memtable, so each record goes to its own.
++    std::map<uint32_t, MemTable*> mems;
++    for (const auto& entry : cfs_) {
++      if (!entry.second->dropped) mems[entry.first] = entry.second->mem;
++    }
++
++    // Add to log and apply to the memtables.  We can release the lock
+     // during this phase since &w is currently responsible for logging
+     // and protects against concurrent loggers and concurrent writes
+-    // into mem_.
++    // into the memtables.
+     {
+       mutex_.Unlock();
+       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+@@ -1236,7 +1803,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+         }
+       }
+       if (status.ok()) {
+-        status = WriteBatchInternal::InsertInto(write_batch, mem_);
++        status = WriteBatchInternal::InsertInto(write_batch, mems);
+       }
+       mutex_.Lock();
+       if (sync_error) {
+@@ -1248,7 +1815,12 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+     }
+     if (write_batch == tmp_batch_) tmp_batch_->Clear();
+ 
+-    versions_->SetLastSequence(last_sequence);
++    last_sequence_ = last_sequence;
++    // Each family's manifest records the sequence it last saw, so a reopen
++    // can take the largest of them.
++    for (const auto& entry : cfs_) {
++      entry.second->versions->SetLastSequence(last_sequence);
++    }
+   }
+ 
+   while (true) {
+@@ -1322,18 +1894,86 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
+ 
+ // REQUIRES: mutex_ is held
+ // REQUIRES: this thread is currently at the front of the writer queue
+-Status DBImpl::MakeRoomForWrite(bool force) {
++Status DBImpl::SwitchLog() {
++  mutex_.AssertHeld();
++  // Log numbers come from the default family's file numbers: the logs live
++  // in the database directory, which is that family's own.
++  uint64_t new_log_number = default_cf_->versions->NewFileNumber();
++  WritableFile* lfile = nullptr;
++  Status s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
++  if (!s.ok()) {
++    // Avoid chewing through file number space in a tight loop.
++    default_cf_->versions->ReuseFileNumber(new_log_number);
++    return s;
++  }
++  delete log_;
++  delete logfile_;
++  logfile_ = lfile;
++  logfile_number_ = new_log_number;
++  log_ = new log::Writer(lfile);
++  return s;
++}
++
++Status DBImpl::MakeRoomForWrite(const std::set<uint32_t>& families, bool force) {
+   mutex_.AssertHeld();
+   assert(!writers_.empty());
+   bool allow_delay = !force;
+   Status s;
++  // The families the batch touches, plus any that is holding an old log
++  // back: those have to be flushed so the log can be deleted.
+   while (true) {
+     if (!bg_error_.ok()) {
+       // Yield previous error
+       s = bg_error_;
+       break;
+-    } else if (allow_delay && versions_->NumLevelFiles(0) >=
+-                                  config::kL0_SlowdownWritesTrigger) {
++    }
++    // Pick a family that needs room.  `force` (a null batch) applies to the
++    // default family, as it always did.
++    ColumnFamily* cf = nullptr;
++    bool over_l0_soft = false, over_l0_hard = false, waiting = false;
++    std::set<uint32_t> want = families;
++    if (force) want.insert(0);
++    // Families lagging far behind on the shared log are flushed too, so
++    // that old logs can go.
++    const uint64_t oldest = OldestLiveLog();
++    if (logfile_number_ > oldest + kMaxLiveLogs) {
++      for (const auto& entry : cfs_) {
++        ColumnFamily* candidate = entry.second;
++        if (candidate->dropped || candidate->imm != nullptr) continue;
++        if (candidate->mem_log_number <= oldest) want.insert(entry.first);
++      }
++    }
++    for (uint32_t id : want) {
++      auto it = cfs_.find(id);
++      if (it == cfs_.end() || it->second->dropped) continue;
++      ColumnFamily* candidate = it->second;
++      const bool full =
++          (force && candidate == default_cf_) ||
++          candidate->mem == nullptr ||
++          candidate->mem->ApproximateMemoryUsage() >
++              candidate->options.write_buffer_size ||
++          (candidate->mem_log_number <= oldest &&
++           logfile_number_ > oldest + kMaxLiveLogs && candidate->mem->ApproximateMemoryUsage() > 0);
++      if (!full) {
++        if (allow_delay && candidate->versions->NumLevelFiles(0) >=
++                               config::kL0_SlowdownWritesTrigger) {
++          over_l0_soft = true;
++        }
++        continue;
++      }
++      if (candidate->imm != nullptr) {
++        waiting = true;  // its previous memtable is still being flushed
++        continue;
++      }
++      if (candidate->versions->NumLevelFiles(0) >=
++          config::kL0_StopWritesTrigger) {
++        over_l0_hard = true;
++        continue;
++      }
++      cf = candidate;
++      break;
++    }
++    if (cf == nullptr && over_l0_soft) {
+       // We are getting close to hitting a hard limit on the number of
+       // L0 files.  Rather than delaying a single write by several
+       // seconds when we hit the hard limit, start delaying each
+@@ -1344,50 +1984,46 @@ Status DBImpl::MakeRoomForWrite(bool force) {
+       env_->SleepForMicroseconds(1000);
+       allow_delay = false;  // Do not delay a single write more than once
+       mutex_.Lock();
+-    } else if (!force &&
+-               (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
+-      // There is room in current memtable
+-      break;
+-    } else if (imm_ != nullptr) {
+-      // We have filled up the current memtable, but the previous
+-      // one is still being compacted, so we wait.
+-      Log(options_.info_log, "Current memtable full; waiting...\n");
+-      background_work_finished_signal_.Wait();
+-    } else if (versions_->NumLevelFiles(0) >= config::kL0_StopWritesTrigger) {
+-      // There are too many level-0 files.
+-      Log(options_.info_log, "Too many L0 files; waiting...\n");
++      continue;
++    }
++    if (cf == nullptr && (waiting || over_l0_hard)) {
++      Log(db_options_.info_log, "Waiting for background work\n");
+       background_work_finished_signal_.Wait();
+-    } else {
+-      // Attempt to switch to a new memtable and trigger compaction of old
+-      assert(versions_->PrevLogNumber() == 0);
+-      uint64_t new_log_number = versions_->NewFileNumber();
+-      WritableFile* lfile = nullptr;
+-      s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
+-      if (!s.ok()) {
+-        // Avoid chewing through file number space in a tight loop.
+-        versions_->ReuseFileNumber(new_log_number);
+-        break;
+-      }
+-      delete log_;
+-      delete logfile_;
+-      logfile_ = lfile;
+-      logfile_number_ = new_log_number;
+-      log_ = new log::Writer(lfile);
+-      imm_ = mem_;
+-      has_imm_.store(true, std::memory_order_release);
+-      mem_ = new MemTable(internal_comparator_);
+-      mem_->Ref();
+-      force = false;  // Do not force another compaction if have room
+-      MaybeScheduleCompaction();
++      continue;
++    }
++    if (cf == nullptr) {
++      break;  // every family the batch touches has room
+     }
++    // Attempt to switch to a new memtable and trigger a flush of the old.
++    // The new memtable writes to a new log, so the old one can be deleted
++    // once every family that used it has flushed.
++    assert(cf->versions->PrevLogNumber() == 0);
++    s = SwitchLog();
++    if (!s.ok()) break;
++    cf->imm = cf->mem;
++    cf->imm_log_number = cf->mem_log_number;
++    cf->has_imm.store(true, std::memory_order_release);
++    pending_flush_.store(true, std::memory_order_release);
++    cf->mem = new MemTable(cf->icmp);
++    cf->mem->Ref();
++    cf->mem_log_number = logfile_number_;
++    force = false;  // Do not force another compaction if have room
++    MaybeScheduleCompaction();
+   }
+   return s;
+ }
+ 
+ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
++  return GetProperty(nullptr, property, value);
++}
++
++bool DBImpl::GetProperty(ColumnFamilyHandle* handle, const Slice& property,
++                         std::string* value) {
+   value->clear();
+ 
+   MutexLock l(&mutex_);
++  ColumnFamily* cf = nullptr;
++  if (!CheckFamily(handle, &cf).ok()) return false;
+   Slice in = property;
+   Slice prefix("leveldb.");
+   if (!in.starts_with(prefix)) return false;
+@@ -1402,7 +2038,7 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
+     } else {
+       char buf[100];
+       std::snprintf(buf, sizeof(buf), "%d",
+-                    versions_->NumLevelFiles(static_cast<int>(level)));
++                    cf->versions->NumLevelFiles(static_cast<int>(level)));
+       *value = buf;
+       return true;
+     }
+@@ -1414,27 +2050,27 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
+                   "--------------------------------------------------\n");
+     value->append(buf);
+     for (int level = 0; level < config::kNumLevels; level++) {
+-      int files = versions_->NumLevelFiles(level);
+-      if (stats_[level].micros > 0 || files > 0) {
++      int files = cf->versions->NumLevelFiles(level);
++      if (cf->stats[level].micros > 0 || files > 0) {
+         std::snprintf(buf, sizeof(buf), "%3d %8d %8.0f %9.0f %8.0f %9.0f\n",
+-                      level, files, versions_->NumLevelBytes(level) / 1048576.0,
+-                      stats_[level].micros / 1e6,
+-                      stats_[level].bytes_read / 1048576.0,
+-                      stats_[level].bytes_written / 1048576.0);
++                      level, files, cf->versions->NumLevelBytes(level) / 1048576.0,
++                      cf->stats[level].micros / 1e6,
++                      cf->stats[level].bytes_read / 1048576.0,
++                      cf->stats[level].bytes_written / 1048576.0);
+         value->append(buf);
+       }
+     }
+     return true;
+   } else if (in == "sstables") {
+-    *value = versions_->current()->DebugString();
++    *value = cf->versions->current()->DebugString();
+     return true;
+   } else if (in == "approximate-memory-usage") {
+-    size_t total_usage = options_.block_cache->TotalCharge();
+-    if (mem_) {
+-      total_usage += mem_->ApproximateMemoryUsage();
++    size_t total_usage = cf->options.block_cache->TotalCharge();
++    if (cf->mem) {
++      total_usage += cf->mem->ApproximateMemoryUsage();
+     }
+-    if (imm_) {
+-      total_usage += imm_->ApproximateMemoryUsage();
++    if (cf->imm) {
++      total_usage += cf->imm->ApproximateMemoryUsage();
+     }
+     char buf[50];
+     std::snprintf(buf, sizeof(buf), "%llu",
+@@ -1449,15 +2085,16 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
+ void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
+   // TODO(opt): better implementation
+   MutexLock l(&mutex_);
+-  Version* v = versions_->current();
++  ColumnFamily* cf = default_cf_;
++  Version* v = cf->versions->current();
+   v->Ref();
+ 
+   for (int i = 0; i < n; i++) {
+     // Convert user_key into a corresponding internal key.
+     InternalKey k1(range[i].start, kMaxSequenceNumber, kValueTypeForSeek);
+     InternalKey k2(range[i].limit, kMaxSequenceNumber, kValueTypeForSeek);
+-    uint64_t start = versions_->ApproximateOffsetOf(v, k1);
+-    uint64_t limit = versions_->ApproximateOffsetOf(v, k2);
++    uint64_t start = cf->versions->ApproximateOffsetOf(v, k1);
++    uint64_t limit = cf->versions->ApproximateOffsetOf(v, k2);
+     sizes[i] = (limit >= start ? limit - start : 0);
+   }
+ 
+@@ -1478,51 +2115,336 @@ Status DB::Delete(const WriteOptions& opt, const Slice& key) {
    return Write(opt, &batch);
  }
  
@@ -795,14 +2472,374 @@ index 1a4e459..517888d 100644
 +  return Write(opt, &batch);
 +}
 +
++// Column-family variants: the base class routes them through Write, so an
++// engine only has to implement Write and Get.
++Status DB::Put(const WriteOptions& opt, ColumnFamilyHandle* family,
++               const Slice& key, const Slice& value) {
++  WriteBatch batch;
++  batch.Put(family, key, value);
++  return Write(opt, &batch);
++}
++
++Status DB::Delete(const WriteOptions& opt, ColumnFamilyHandle* family,
++                  const Slice& key) {
++  WriteBatch batch;
++  batch.Delete(family, key);
++  return Write(opt, &batch);
++}
++
++Status DB::DeleteRange(const WriteOptions& opt, ColumnFamilyHandle* family,
++                       const Slice& begin, const Slice& end) {
++  WriteBatch batch;
++  batch.DeleteRange(family, begin, end);
++  return Write(opt, &batch);
++}
++
++Status DB::Merge(const WriteOptions& opt, ColumnFamilyHandle* family,
++                 const Slice& key, const Slice& value) {
++  WriteBatch batch;
++  batch.Merge(family, key, value);
++  return Write(opt, &batch);
++}
++
++Status DB::Get(const ReadOptions& options, ColumnFamilyHandle* family,
++               const Slice& key, std::string* value) {
++  if (family != nullptr && family->GetID() != 0) {
++    return Status::NotSupported("column families");
++  }
++  return Get(options, key, value);
++}
++
++Iterator* DB::NewIterator(const ReadOptions& options,
++                          ColumnFamilyHandle* family) {
++  if (family != nullptr && family->GetID() != 0) {
++    return NewErrorIterator(Status::NotSupported("column families"));
++  }
++  return NewIterator(options);
++}
++
++bool DB::GetProperty(ColumnFamilyHandle* family, const Slice& property,
++                     std::string* value) {
++  if (family != nullptr && family->GetID() != 0) return false;
++  return GetProperty(property, value);
++}
++
++void DB::CompactRange(ColumnFamilyHandle* family, const Slice* begin,
++                      const Slice* end) {
++  if (family == nullptr || family->GetID() == 0) CompactRange(begin, end);
++}
++
++Status DB::CreateColumnFamily(const Options& options, const std::string& name,
++                              ColumnFamilyHandle** handle) {
++  return Status::NotSupported("column families");
++}
++
++Status DB::DropColumnFamily(ColumnFamilyHandle* handle) {
++  return Status::NotSupported("column families");
++}
++
++Status DB::DestroyColumnFamilyHandle(ColumnFamilyHandle* handle) {
++  return Status::NotSupported("column families");
++}
++
++ColumnFamilyHandle* DB::DefaultColumnFamily() const { return nullptr; }
++
  DB::~DB() = default;
  
++Status DBImpl::CreateColumnFamilyLocked(const Options& options,
++                                        const std::string& name,
++                                        ColumnFamilyHandle** handle) {
++  mutex_.AssertHeld();
++  if (name == kDefaultColumnFamilyName) {
++    return Status::InvalidArgument("the default column family exists");
++  }
++  for (const auto& entry : cfs_) {
++    if (!entry.second->dropped && entry.second->name == name) {
++      return Status::InvalidArgument("column family exists", name);
++    }
++  }
++  const uint32_t id = next_family_id_++;
++  const std::string dir = ColumnFamilyDir(dbname_, id);
++  // Ignore an error from CreateDir: the directory may be left over from a
++  // crash, and the family is committed by its descriptor, not its directory.
++  env_->CreateDir(dir);
++  Status s = NewDB(dir);
++  if (!s.ok()) return s;
++
++  Options raw = options;
++  raw.env = env_;
++  raw.info_log = db_options_.info_log;
++  raw.block_cache = db_options_.block_cache;
++  raw.max_open_files = db_options_.max_open_files;
++  raw.comparator = user_comparator_;
++  ColumnFamily* cf = new ColumnFamily(id, name, dir, raw, user_comparator_);
++  cf->options = SanitizeOptions(dir, &cf->icmp, &cf->ipolicy, raw);
++  cf->options.info_log = db_options_.info_log;
++  cf->options.block_cache = db_options_.block_cache;
++  cf->refs = 1;
++  bool save_manifest = false;
++  VersionEdit edit;
++  s = OpenColumnFamily(cf, &save_manifest, &edit);
++  if (!s.ok()) {
++    delete cf->versions;
++    delete cf->table_cache;
++    delete cf;
++    return s;
++  }
++  cf->mem = new MemTable(cf->icmp);
++  cf->mem->Ref();
++  cf->mem_log_number = logfile_number_;
++  // A new family starts at the current log: nothing older belongs to it.
++  VersionEdit log_edit;
++  log_edit.SetLogNumber(logfile_number_);
++  log_edit.SetLastSequence(last_sequence_);
++  s = cf->versions->LogAndApply(&log_edit, &mutex_);
++  if (!s.ok()) {
++    delete cf->versions;
++    delete cf->table_cache;
++    if (cf->mem != nullptr) cf->mem->Unref();
++    delete cf;
++    return s;
++  }
++  cfs_[id] = cf;
++
++  // Record it, so a reopen finds it.
++  std::vector<std::pair<uint32_t, std::string>> on_disk;
++  for (const auto& entry : cfs_) {
++    if (entry.first != 0 && !entry.second->dropped) {
++      on_disk.emplace_back(entry.first, entry.second->name);
++    }
++  }
++  s = WriteFamilies(env_, dbname_, on_disk, next_family_id_);
++  if (!s.ok()) return s;
++  cf->refs++;  // the handle below
++  *handle = new ColumnFamilyHandleImpl(cf, this);
++  return Status::OK();
++}
++
++Status DBImpl::CreateColumnFamily(const Options& options,
++                                  const std::string& name,
++                                  ColumnFamilyHandle** handle) {
++  MutexLock l(&mutex_);
++  return CreateColumnFamilyLocked(options, name, handle);
++}
++
++Status DBImpl::DropColumnFamily(ColumnFamilyHandle* handle) {
++  MutexLock l(&mutex_);
++  ColumnFamily* cf = nullptr;
++  Status s = CheckFamily(handle, &cf);
++  if (!s.ok()) return s;
++  if (cf->id == 0) {
++    return Status::InvalidArgument("the default column family cannot be dropped");
++  }
++  // Wait for background work on this family to finish, so nothing writes
++  // into the directory while it is going away.
++  while (background_compaction_scheduled_) {
++    background_work_finished_signal_.Wait();
++  }
++  cf->dropped = true;
++  if (cf->mem != nullptr) {
++    cf->mem->Unref();
++    cf->mem = nullptr;
++  }
++  if (cf->imm != nullptr) {
++    cf->imm->Unref();
++    cf->imm = nullptr;
++    cf->has_imm.store(false, std::memory_order_release);
++  }
++
++  std::vector<std::pair<uint32_t, std::string>> on_disk;
++  for (const auto& entry : cfs_) {
++    if (entry.first != 0 && !entry.second->dropped) {
++      on_disk.emplace_back(entry.first, entry.second->name);
++    }
++  }
++  s = WriteFamilies(env_, dbname_, on_disk, next_family_id_);
++  if (!s.ok()) return s;
++
++  // Its files are nobody's now.
++  const std::string dir = cf->dir;
++  std::vector<std::string> filenames;
++  mutex_.Unlock();
++  env_->GetChildren(dir, &filenames);
++  for (const std::string& filename : filenames) {
++    if (filename == "." || filename == "..") continue;
++    env_->RemoveFile(dir + "/" + filename);
++  }
++  env_->RemoveDir(dir);
++  mutex_.Lock();
++  return Status::OK();
++}
++
++Status DBImpl::DestroyColumnFamilyHandle(ColumnFamilyHandle* handle) {
++  if (handle == nullptr) return Status::InvalidArgument("null handle");
++  MutexLock l(&mutex_);
++  ColumnFamilyHandleImpl* impl = static_cast<ColumnFamilyHandleImpl*>(handle);
++  if (impl->db() != this) {
++    return Status::InvalidArgument("column family of another database");
++  }
++  if (impl == default_handle_) return Status::OK();  // owned by the database
++  ColumnFamily* cf = impl->cf();
++  delete impl;
++  if (--cf->refs <= 0 && cf->dropped) {
++    cfs_.erase(cf->id);
++    delete cf->versions;
++    delete cf->table_cache;
++    delete cf;
++  }
++  return Status::OK();
++}
++
++ColumnFamilyHandle* DBImpl::DefaultColumnFamily() const {
++  return default_handle_;
++}
++
  Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
++  std::vector<ColumnFamilyHandle*> handles;
++  return DB::Open(options, dbname, std::vector<ColumnFamilyDescriptor>(),
++                  &handles, dbptr);
++}
++
++Status DB::Open(const Options& db_options, const std::string& dbname,
++                const std::vector<ColumnFamilyDescriptor>& families,
++                std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
+   *dbptr = nullptr;
++  if (handles != nullptr) handles->clear();
+ 
+-  DBImpl* impl = new DBImpl(options, dbname);
++  DBImpl* impl = new DBImpl(db_options, dbname);
+   impl->mutex_.Lock();
+-  VersionEdit edit;
+   // Recover handles create_if_missing, error_if_exists
+   bool save_manifest = false;
+-  Status s = impl->Recover(&edit, &save_manifest);
+-  if (s.ok() && impl->mem_ == nullptr) {
+-    // Create new log and a corresponding memtable.
+-    uint64_t new_log_number = impl->versions_->NewFileNumber();
+-    WritableFile* lfile;
+-    s = options.env->NewWritableFile(LogFileName(dbname, new_log_number),
+-                                     &lfile);
+-    if (s.ok()) {
+-      edit.SetLogNumber(new_log_number);
+-      impl->logfile_ = lfile;
+-      impl->logfile_number_ = new_log_number;
+-      impl->log_ = new log::Writer(lfile);
+-      impl->mem_ = new MemTable(impl->internal_comparator_);
+-      impl->mem_->Ref();
+-    }
++  Status s = impl->Recover(families, db_options.create_missing_column_families,
++                           &save_manifest);
++  if (s.ok() && impl->log_ == nullptr) {
++    // Create a new log; every family that has no memtable yet starts on it.
++    s = impl->SwitchLog();
+   }
+-  if (s.ok() && save_manifest) {
+-    edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
+-    edit.SetLogNumber(impl->logfile_number_);
+-    s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
++  if (s.ok()) {
++    for (const auto& entry : impl->cfs_) {
++      ColumnFamily* cf = entry.second;
++      if (cf->mem == nullptr) {
++        cf->mem = new MemTable(cf->icmp);
++        cf->mem->Ref();
++        cf->mem_log_number = impl->logfile_number_;
++      }
++      auto it = impl->recovery_edits_.find(cf->id);
++      const bool has_files = it != impl->recovery_edits_.end();
++      if (save_manifest || has_files || cf->versions->LogNumber() == 0) {
++        VersionEdit edit;
++        if (has_files) edit = it->second;
++        edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
++        // Everything below the log this family's memtable writes to is now
++        // in its tables.
++        edit.SetLogNumber(cf->mem_log_number);
++        s = cf->versions->LogAndApply(&edit, &impl->mutex_);
++        if (!s.ok()) break;
++      }
++    }
+   }
+   if (s.ok()) {
++    impl->default_handle_ = new ColumnFamilyHandleImpl(impl->default_cf_, impl);
++    impl->default_cf_->refs++;
+     impl->RemoveObsoleteFiles();
+     impl->MaybeScheduleCompaction();
+   }
++  if (s.ok() && handles != nullptr) {
++    for (const ColumnFamilyDescriptor& d : families) {
++      ColumnFamily* found = nullptr;
++      for (const auto& entry : impl->cfs_) {
++        if (!entry.second->dropped && entry.second->name == d.name) {
++          found = entry.second;
++          break;
++        }
++      }
++      if (found == nullptr) {
++        s = Status::InvalidArgument("column family does not exist", d.name);
++        break;
++      }
++      if (found->id == 0) {
++        handles->push_back(impl->default_handle_);
++      } else {
++        found->refs++;
++        handles->push_back(new ColumnFamilyHandleImpl(found, impl));
++      }
++    }
++  }
+   impl->mutex_.Unlock();
+   if (s.ok()) {
+-    assert(impl->mem_ != nullptr);
++    assert(impl->default_cf_->mem != nullptr);
+     *dbptr = impl;
+   } else {
++    if (handles != nullptr) handles->clear();
+     delete impl;
+   }
+   return s;
+ }
+ 
++Status DB::ListColumnFamilies(const Options& options, const std::string& name,
++                              std::vector<std::string>* names) {
++  names->clear();
++  names->push_back(kDefaultColumnFamilyName);
++  std::vector<std::pair<uint32_t, std::string>> families;
++  uint32_t next_id = 1;
++  Status s = ReadFamilies(options.env, name, &families, &next_id);
++  if (!s.ok()) return s;
++  for (const auto& f : families) names->push_back(f.second);
++  return Status::OK();
++}
++
+ Snapshot::~Snapshot() = default;
+ 
+ Status DestroyDB(const std::string& dbname, const Options& options) {
+@@ -1540,6 +2462,21 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
+   if (result.ok()) {
+     uint64_t number;
+     FileType type;
++    // The column families' directories first, then the database's own files.
++    std::vector<std::pair<uint32_t, std::string>> families;
++    uint32_t next_id = 1;
++    ReadFamilies(env, dbname, &families, &next_id);
++    for (const auto& f : families) {
++      const std::string dir = ColumnFamilyDir(dbname, f.first);
++      std::vector<std::string> names;
++      if (!env->GetChildren(dir, &names).ok()) continue;
++      for (const std::string& name : names) {
++        if (name == "." || name == "..") continue;
++        env->RemoveFile(dir + "/" + name);
++      }
++      env->RemoveDir(dir);
++    }
++    env->RemoveFile(FamiliesFileName(dbname));
+     for (size_t i = 0; i < filenames.size(); i++) {
+       if (ParseFileName(filenames[i], &number, &type) &&
+           type != kDBLockFile) {  // Lock file will be deleted at end
 diff --git a/db/db_impl.h b/db/db_impl.h
-index c7b0172..465b87c 100644
+index c7b0172..6f3e41d 100644
 --- a/db/db_impl.h
 +++ b/db/db_impl.h
-@@ -7,10 +7,12 @@
+@@ -7,12 +7,18 @@
  
  #include <atomic>
  #include <deque>
@@ -810,47 +2847,192 @@ index c7b0172..465b87c 100644
  #include <set>
  #include <string>
  
++#include <map>
++
++#include "db/column_family.h"
  #include "db/dbformat.h"
 +#include "db/range_del_view.h"
  #include "db/log_writer.h"
  #include "db/snapshot.h"
++#include "db/version_edit.h"
  #include "leveldb/db.h"
-@@ -39,6 +41,10 @@ class DBImpl : public DB {
+ #include "leveldb/env.h"
+ #include "port/port.h"
+@@ -38,16 +44,41 @@ class DBImpl : public DB {
+   // Implementations of the DB interface
    Status Put(const WriteOptions&, const Slice& key,
               const Slice& value) override;
++  Status Put(const WriteOptions&, ColumnFamilyHandle*, const Slice& key,
++             const Slice& value) override;
    Status Delete(const WriteOptions&, const Slice& key) override;
++  Status Delete(const WriteOptions&, ColumnFamilyHandle*,
++                const Slice& key) override;
 +  Status DeleteRange(const WriteOptions&, const Slice& begin,
 +                     const Slice& end) override;
++  Status DeleteRange(const WriteOptions&, ColumnFamilyHandle*,
++                     const Slice& begin, const Slice& end) override;
 +  Status Merge(const WriteOptions&, const Slice& key,
++               const Slice& value) override;
++  Status Merge(const WriteOptions&, ColumnFamilyHandle*, const Slice& key,
 +               const Slice& value) override;
    Status Write(const WriteOptions& options, WriteBatch* updates) override;
    Status Get(const ReadOptions& options, const Slice& key,
               std::string* value) override;
-@@ -101,9 +107,20 @@ class DBImpl : public DB {
-     int64_t bytes_written;
-   };
++  Status Get(const ReadOptions& options, ColumnFamilyHandle*, const Slice& key,
++             std::string* value) override;
+   Iterator* NewIterator(const ReadOptions&) override;
++  Iterator* NewIterator(const ReadOptions&, ColumnFamilyHandle*) override;
+   const Snapshot* GetSnapshot() override;
+   void ReleaseSnapshot(const Snapshot* snapshot) override;
+   bool GetProperty(const Slice& property, std::string* value) override;
++  bool GetProperty(ColumnFamilyHandle*, const Slice& property,
++                   std::string* value) override;
+   void GetApproximateSizes(const Range* range, int n, uint64_t* sizes) override;
+   void CompactRange(const Slice* begin, const Slice* end) override;
++  void CompactRange(ColumnFamilyHandle*, const Slice* begin,
++                    const Slice* end) override;
++
++  Status CreateColumnFamily(const Options& options, const std::string& name,
++                            ColumnFamilyHandle** handle) override;
++  Status DropColumnFamily(ColumnFamilyHandle* handle) override;
++  Status DestroyColumnFamilyHandle(ColumnFamilyHandle* handle) override;
++  ColumnFamilyHandle* DefaultColumnFamily() const override;
  
+   // Extra methods (for testing) that are not in the public DB interface
+ 
+@@ -73,71 +104,87 @@ class DBImpl : public DB {
+ 
+  private:
+   friend class DB;
++  friend Status DB::Open(const Options&, const std::string&,
++                         const std::vector<ColumnFamilyDescriptor>&,
++                         std::vector<ColumnFamilyHandle*>*, DB**);
+   struct CompactionState;
+   struct Writer;
+ 
+-  // Information for a manual compaction
+-  struct ManualCompaction {
+-    int level;
+-    bool done;
+-    const InternalKey* begin;  // null means beginning of key range
+-    const InternalKey* end;    // null means end of key range
+-    InternalKey tmp_storage;   // Used to keep track of compaction progress
+-  };
+-
+-  // Per level compaction stats.  stats_[level] stores the stats for
+-  // compactions that produced data for the specified "level".
+-  struct CompactionStats {
+-    CompactionStats() : micros(0), bytes_read(0), bytes_written(0) {}
+-
+-    void Add(const CompactionStats& c) {
+-      this->micros += c.micros;
+-      this->bytes_read += c.bytes_read;
+-      this->bytes_written += c.bytes_written;
+-    }
+-
+-    int64_t micros;
+-    int64_t bytes_read;
+-    int64_t bytes_written;
+-  };
+-
 -  Iterator* NewInternalIterator(const ReadOptions&,
 -                                SequenceNumber* latest_snapshot,
 -                                uint32_t* seed);
+-
+-  Status NewDB();
+-
+-  // Recover the descriptor from persistent storage.  May do a significant
+-  // amount of work to recover recently logged updates.  Any changes to
+-  // be made to the descriptor are added to *edit.
+-  Status Recover(VersionEdit* edit, bool* save_manifest)
 +  // Also returns, in *range_dels, a view of every range tombstone the
 +  // iterator may meet (nullptr if there is none); the iterators of older
 +  // layers then skip what newer layers' tombstones hide.
 +  Iterator* NewInternalIterator(
-+      const ReadOptions&, SequenceNumber* latest_snapshot, uint32_t* seed,
-+      std::shared_ptr<const RangeDelView>* range_dels = nullptr);
++      const ReadOptions&, ColumnFamily* cf, SequenceNumber* latest_snapshot,
++      uint32_t* seed, std::shared_ptr<const RangeDelView>* range_dels = nullptr);
 +
 +  // A view of the range tombstones of mem, imm and v, nullptr if they hold
 +  // none.  The memtables answer from their own fragment maps; the tables'
 +  // tombstones are indexed once per version.
-+  std::shared_ptr<const RangeDelView> RangeDelsLocked(MemTable* mem,
++  std::shared_ptr<const RangeDelView> RangeDelsLocked(ColumnFamily* cf,
++                                                      MemTable* mem,
 +                                                      MemTable* imm,
 +                                                      Version* v, Status* s)
 +      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++
++  // Creates the on-disk state of one family (its directory, CURRENT and
++  // MANIFEST); the default family's is the database's own.
++  Status NewDB(const std::string& dir);
++
++  // Opens the family's version set, and its memtable if the log is replayed
++  // later.  Called for every family at open.
++  Status OpenColumnFamily(ColumnFamily* cf, bool* save_manifest,
++                          VersionEdit* edit) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++
++  // Recover the descriptors of every family from persistent storage and
++  // replay the shared log.  `families` names the families the caller
++  // expects (empty: whatever the database has, which must be the default
++  // one alone).
++  Status Recover(const std::vector<ColumnFamilyDescriptor>& families,
++                 bool create_missing_families, bool* save_manifest)
+       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
  
-   Status NewDB();
+   void MaybeIgnoreError(Status* s) const;
  
-@@ -147,7 +164,11 @@ class DBImpl : public DB {
+-  // Delete any unneeded files and stale in-memory entries.
++  // Delete any unneeded files and stale in-memory entries, over every
++  // family and the shared logs.
+   void RemoveObsoleteFiles() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+-  // Compact the in-memory write buffer to disk.  Switches to a new
+-  // log-file/memtable and writes a new descriptor iff successful.
+-  // Errors are recorded in bg_error_.
+-  void CompactMemTable() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  // Compact the in-memory write buffer of `cf` to disk.  Errors are
++  // recorded in bg_error_.
++  void CompactMemTable(ColumnFamily* cf) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+-  Status RecoverLogFile(uint64_t log_number, bool last_log, bool* save_manifest,
+-                        VersionEdit* edit, SequenceNumber* max_sequence)
++  Status RecoverLogFile(uint64_t log_number, bool last_log,
++                        SequenceNumber* max_sequence)
+       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+-  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
++  Status WriteLevel0Table(ColumnFamily* cf, MemTable* mem, VersionEdit* edit,
++                          Version* base) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++
++  // Makes room in every family of `families` (ids), switching memtables and
++  // the shared log as needed.
++  Status MakeRoomForWrite(const std::set<uint32_t>& families, bool force)
+       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+-  Status MakeRoomForWrite(bool force /* compact even if there is room? */)
++  // Starts a new log file and moves every family whose memtable is being
++  // flushed onto it; also flushes families that hold old logs back.
++  Status SwitchLog() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++
++  // The oldest log any family still needs.
++  uint64_t OldestLiveLog() const EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++
++  Status CreateColumnFamilyLocked(const Options& options,
++                                  const std::string& name,
++                                  ColumnFamilyHandle** handle)
+       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  ColumnFamily* FamilyOf(ColumnFamilyHandle* handle) const;
++  Status CheckFamily(ColumnFamilyHandle* handle, ColumnFamily** cf) const;
+   WriteBatch* BuildBatchGroup(Writer** last_writer)
+       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+   void RecordBackgroundError(const Status& s);
+ 
+   void MaybeScheduleCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  bool NeedsBackgroundWork() const EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+   static void BGWork(void* db);
+   void BackgroundCall();
+   void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+@@ -147,26 +194,24 @@ class DBImpl : public DB {
        EXCLUSIVE_LOCKS_REQUIRED(mutex_);
  
    Status OpenCompactionOutputFile(CompactionState* compact);
@@ -863,17 +3045,80 @@ index c7b0172..465b87c 100644
    Status InstallCompactionResults(CompactionState* compact)
        EXCLUSIVE_LOCKS_REQUIRED(mutex_);
  
-@@ -203,6 +224,13 @@ class DBImpl : public DB {
-   Status bg_error_ GUARDED_BY(mutex_);
+-  const Comparator* user_comparator() const {
+-    return internal_comparator_.user_comparator();
+-  }
++  const Comparator* user_comparator() const { return user_comparator_; }
  
-   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
+   // Constant after construction
+   Env* const env_;
+-  const InternalKeyComparator internal_comparator_;
+-  const InternalFilterPolicy internal_filter_policy_;
+-  const Options options_;  // options_.comparator == &internal_comparator_
++  const Comparator* const user_comparator_;
++  const Options db_options_;  // shared options (env, info_log, caches, ...)
+   const bool owns_info_log_;
+   const bool owns_cache_;
+   const std::string dbname_;
+ 
+-  // table_cache_ provides its own synchronization
+-  TableCache* const table_cache_;
+-
+   // Lock over the persistent DB state.  Non-null iff successfully acquired.
+   FileLock* db_lock_;
+ 
+@@ -174,35 +219,42 @@ class DBImpl : public DB {
+   port::Mutex mutex_;
+   std::atomic<bool> shutting_down_;
+   port::CondVar background_work_finished_signal_ GUARDED_BY(mutex_);
+-  MemTable* mem_;
+-  MemTable* imm_ GUARDED_BY(mutex_);  // Memtable being compacted
+-  std::atomic<bool> has_imm_;         // So bg thread can detect non-null imm_
 +
-+  struct RangeDelCache {
-+    uint64_t version_id = 0;
-+    bool version_has_range_dels = false;
-+    std::shared_ptr<const RangeDelIndex> index;  // the version's tables
-+  };
-+  RangeDelCache range_del_cache_ GUARDED_BY(mutex_);
++  // The column families, by id, and their handles.  cfs_ owns them; a
++  // family stays alive while a handle or the database holds a reference.
++  std::map<uint32_t, ColumnFamily*> cfs_ GUARDED_BY(mutex_);
++  ColumnFamily* default_cf_ = nullptr;
++  ColumnFamilyHandleImpl* default_handle_ = nullptr;
++  uint32_t next_family_id_ GUARDED_BY(mutex_) = 1;
++
+   WritableFile* logfile_;
+   uint64_t logfile_number_ GUARDED_BY(mutex_);
+   log::Writer* log_;
+   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
++  // The database's sequence numbers, shared by every family.
++  SequenceNumber last_sequence_ GUARDED_BY(mutex_) = 0;
+ 
+   // Queue of writers.
++  // Files written while replaying the log at open, per family: they are
++  // applied once, at the end, with the log number of the memtable that
++  // will take the writes.  Applying them earlier would claim a log is
++  // flushed while its later records are still being replayed.
++  std::map<uint32_t, VersionEdit> recovery_edits_ GUARDED_BY(mutex_);
++
+   std::deque<Writer*> writers_ GUARDED_BY(mutex_);
+   WriteBatch* tmp_batch_ GUARDED_BY(mutex_);
+ 
+   SnapshotList snapshots_ GUARDED_BY(mutex_);
+ 
+-  // Set of table files to protect from deletion because they are
+-  // part of ongoing compactions.
+-  std::set<uint64_t> pending_outputs_ GUARDED_BY(mutex_);
++  // Set while any family has a memtable waiting to be flushed, so a
++  // running compaction can notice without taking the lock.
++  std::atomic<bool> pending_flush_{false};
+ 
+   // Has a background compaction been scheduled or is running?
+   bool background_compaction_scheduled_ GUARDED_BY(mutex_);
+ 
+-  ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
+-
+-  VersionSet* const versions_ GUARDED_BY(mutex_);
+-
+   // Have we encountered a background error in paranoid mode?
+   Status bg_error_ GUARDED_BY(mutex_);
+-
+-  CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
  };
  
  // Sanitize db options.  The caller should delete result.info_log if
@@ -1271,10 +3516,10 @@ index 5977fc8..0722aed 100644
  }  // namespace leveldb
  
 diff --git a/db/dbformat.h b/db/dbformat.h
-index a1c30ed..03100a4 100644
+index a1c30ed..2919bcb 100644
 --- a/db/dbformat.h
 +++ b/db/dbformat.h
-@@ -51,14 +51,24 @@ class InternalKey;
+@@ -51,14 +51,37 @@ class InternalKey;
  // Value types encoded as the last component of internal keys.
  // DO NOT CHANGE THESE ENUM VALUES: they are embedded in the on-disk
  // data structures.
@@ -1298,10 +3543,23 @@ index a1c30ed..03100a4 100644
  // ValueType, not the lowest).
 -static const ValueType kValueTypeForSeek = kTypeValue;
 +static const ValueType kValueTypeForSeek = kTypeRangeDeletion;
++
++// WriteBatch record tags for entries of a non-default column family: the
++// tag is followed by the family id (varint32) and then the same payload as
++// the tag it mirrors.  Records of the default family keep the plain tags,
++// so a database that only uses it stays byte-compatible.
++// The tag of a record of family `cf` is kCFTagBase + the plain tag.
++enum ColumnFamilyRecordTag {
++  kCFTagBase = 0x10,
++  kCFTypeDeletion = kCFTagBase + kTypeDeletion,
++  kCFTypeValue = kCFTagBase + kTypeValue,
++  kCFTypeMerge = kCFTagBase + kTypeMerge,
++  kCFTypeRangeDeletion = kCFTagBase + kTypeRangeDeletion
++};
  
  typedef uint64_t SequenceNumber;
  
-@@ -177,7 +187,7 @@ inline bool ParseInternalKey(const Slice& internal_key,
+@@ -177,7 +200,7 @@ inline bool ParseInternalKey(const Slice& internal_key,
    result->sequence = num >> 8;
    result->type = static_cast<ValueType>(c);
    result->user_key = Slice(internal_key.data(), n - 8);
@@ -2681,7 +4939,7 @@ index 1963353..8f1a5f2 100644
    const VersionSet* vset = input_version_->vset_;
    // Scan to find earliest grandparent file that contains key.
 diff --git a/db/version_set.h b/db/version_set.h
-index 69f3d70..231700c 100644
+index 69f3d70..907f9ce 100644
 --- a/db/version_set.h
 +++ b/db/version_set.h
 @@ -15,11 +15,13 @@
@@ -2706,7 +4964,7 @@ index 69f3d70..231700c 100644
  class MemTable;
  class TableBuilder;
  class TableCache;
-@@ -72,8 +75,30 @@ class Version {
+@@ -72,8 +75,33 @@ class Version {
    // REQUIRES: This version has been saved (see VersionSet::SaveTo)
    void AddIterators(const ReadOptions&, std::vector<Iterator*>* iters);
  
@@ -2730,6 +4988,9 @@ index 69f3d70..231700c 100644
 +  // Unique for the life of the process.
 +  uint64_t id() const { return id_; }
 +
++  // How much this version needs a compaction (see VersionSet::Finalize).
++  double CompactionScore() const { return compaction_score_; }
++
 +  // Appends the range tombstones of every file in this version to *out,
 +  // tagged with their layers (see range_del.h).
 +  Status GetRangeTombstones(std::vector<RangeTombstone>* out);
@@ -2739,7 +5000,7 @@ index 69f3d70..231700c 100644
  
    // Adds "stats" into the current state.  Returns true if a new
    // compaction may need to be triggered, false otherwise.
-@@ -127,8 +152,16 @@ class Version {
+@@ -127,8 +155,16 @@ class Version {
          refs_(0),
          file_to_compact_(nullptr),
          file_to_compact_level_(-1),
@@ -2757,7 +5018,7 @@ index 69f3d70..231700c 100644
  
    Version(const Version&) = delete;
    Version& operator=(const Version&) = delete;
-@@ -157,11 +190,18 @@ class Version {
+@@ -157,11 +193,18 @@ class Version {
    FileMetaData* file_to_compact_;
    int file_to_compact_level_;
  
@@ -2776,7 +5037,7 @@ index 69f3d70..231700c 100644
  };
  
  class VersionSet {
-@@ -251,7 +291,8 @@ class VersionSet {
+@@ -251,7 +294,8 @@ class VersionSet {
    // Returns true iff some level needs a compaction.
    bool NeedsCompaction() const {
      Version* v = current_;
@@ -2786,7 +5047,7 @@ index 69f3d70..231700c 100644
    }
  
    // Add all files listed in any live version to *live.
-@@ -349,6 +390,10 @@ class Compaction {
+@@ -349,6 +393,10 @@ class Compaction {
    // in levels greater than "level+1".
    bool IsBaseLevelForKey(const Slice& user_key);
  
@@ -2798,21 +5059,32 @@ index 69f3d70..231700c 100644
    // before processing "internal_key".
    bool ShouldStopBefore(const Slice& internal_key);
 diff --git a/db/write_batch.cc b/db/write_batch.cc
-index b54313c..946954a 100644
+index b54313c..5a1594e 100644
 --- a/db/write_batch.cc
 +++ b/db/write_batch.cc
-@@ -8,7 +8,9 @@
+@@ -8,7 +8,10 @@
  //    data: record[count]
  // record :=
  //    kTypeValue varstring varstring         |
 -//    kTypeDeletion varstring
 +//    kTypeDeletion varstring |
 +//    kTypeMerge varstring varstring |
-+//    kTypeRangeDeletion varstring varstring      (begin, end)
++//    kTypeRangeDeletion varstring varstring |    (begin, end)
++//    kCFType* varint32 <the payload of the tag it mirrors>
  // varstring :=
  //    len: varint32
  //    data: uint8[len]
-@@ -32,6 +34,10 @@ WriteBatch::~WriteBatch() = default;
+@@ -18,6 +21,9 @@
+ #include "db/dbformat.h"
+ #include "db/memtable.h"
+ #include "db/write_batch_internal.h"
++#include <map>
++#include <set>
++
+ #include "leveldb/db.h"
+ #include "util/coding.h"
+ 
+@@ -32,6 +38,29 @@ WriteBatch::~WriteBatch() = default;
  
  WriteBatch::Handler::~Handler() = default;
  
@@ -2820,17 +5092,61 @@ index b54313c..946954a 100644
 +
 +void WriteBatch::Handler::Merge(const Slice& key, const Slice& value) {}
 +
++void WriteBatch::Handler::PutCF(uint32_t cf, const Slice& key,
++                                const Slice& value) {
++  if (cf == 0) Put(key, value);
++}
++
++void WriteBatch::Handler::DeleteCF(uint32_t cf, const Slice& key) {
++  if (cf == 0) Delete(key);
++}
++
++void WriteBatch::Handler::MergeCF(uint32_t cf, const Slice& key,
++                                  const Slice& value) {
++  if (cf == 0) Merge(key, value);
++}
++
++void WriteBatch::Handler::DeleteRangeCF(uint32_t cf, const Slice& begin,
++                                        const Slice& end) {
++  if (cf == 0) DeleteRange(begin, end);
++}
++
  void WriteBatch::Clear() {
    rep_.clear();
    rep_.resize(kHeader);
-@@ -68,6 +74,22 @@ Status WriteBatch::Iterate(Handler* handler) const {
+@@ -52,22 +81,45 @@ Status WriteBatch::Iterate(Handler* handler) const {
+     found++;
+     char tag = input[0];
+     input.remove_prefix(1);
++    uint32_t cf = 0;
++    if (tag >= kCFTagBase && tag <= kCFTypeRangeDeletion) {
++      if (!GetVarint32(&input, &cf)) {
++        return Status::Corruption("bad WriteBatch column family");
++      }
++      tag = static_cast<char>(tag - kCFTagBase);
++    }
+     switch (tag) {
+       case kTypeValue:
+         if (GetLengthPrefixedSlice(&input, &key) &&
+             GetLengthPrefixedSlice(&input, &value)) {
+-          handler->Put(key, value);
++          handler->PutCF(cf, key, value);
+         } else {
+           return Status::Corruption("bad WriteBatch Put");
+         }
+         break;
+       case kTypeDeletion:
+         if (GetLengthPrefixedSlice(&input, &key)) {
+-          handler->Delete(key);
++          handler->DeleteCF(cf, key);
+         } else {
            return Status::Corruption("bad WriteBatch Delete");
          }
          break;
 +      case kTypeMerge:
 +        if (GetLengthPrefixedSlice(&input, &key) &&
 +            GetLengthPrefixedSlice(&input, &value)) {
-+          handler->Merge(key, value);
++          handler->MergeCF(cf, key, value);
 +        } else {
 +          return Status::Corruption("bad WriteBatch Merge");
 +        }
@@ -2838,7 +5154,7 @@ index b54313c..946954a 100644
 +      case kTypeRangeDeletion:
 +        if (GetLengthPrefixedSlice(&input, &key) &&
 +            GetLengthPrefixedSlice(&input, &value)) {
-+          handler->DeleteRange(key, value);
++          handler->DeleteRangeCF(cf, key, value);
 +        } else {
 +          return Status::Corruption("bad WriteBatch DeleteRange");
 +        }
@@ -2846,7 +5162,7 @@ index b54313c..946954a 100644
        default:
          return Status::Corruption("unknown WriteBatch tag");
      }
-@@ -108,6 +130,20 @@ void WriteBatch::Delete(const Slice& key) {
+@@ -108,34 +160,159 @@ void WriteBatch::Delete(const Slice& key) {
    PutLengthPrefixedSlice(&rep_, key);
  }
  
@@ -2864,81 +5180,334 @@ index b54313c..946954a 100644
 +  PutLengthPrefixedSlice(&rep_, value);
 +}
 +
++namespace {
++uint32_t FamilyId(ColumnFamilyHandle* family) {
++  return family == nullptr ? 0 : family->GetID();
++}
++}  // namespace
++
++void WriteBatch::Put(ColumnFamilyHandle* family, const Slice& key,
++                     const Slice& value) {
++  const uint32_t cf = FamilyId(family);
++  if (cf == 0) return Put(key, value);
++  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
++  rep_.push_back(static_cast<char>(kCFTypeValue));
++  PutVarint32(&rep_, cf);
++  PutLengthPrefixedSlice(&rep_, key);
++  PutLengthPrefixedSlice(&rep_, value);
++}
++
++void WriteBatch::Delete(ColumnFamilyHandle* family, const Slice& key) {
++  const uint32_t cf = FamilyId(family);
++  if (cf == 0) return Delete(key);
++  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
++  rep_.push_back(static_cast<char>(kCFTypeDeletion));
++  PutVarint32(&rep_, cf);
++  PutLengthPrefixedSlice(&rep_, key);
++}
++
++void WriteBatch::Merge(ColumnFamilyHandle* family, const Slice& key,
++                       const Slice& value) {
++  const uint32_t cf = FamilyId(family);
++  if (cf == 0) return Merge(key, value);
++  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
++  rep_.push_back(static_cast<char>(kCFTypeMerge));
++  PutVarint32(&rep_, cf);
++  PutLengthPrefixedSlice(&rep_, key);
++  PutLengthPrefixedSlice(&rep_, value);
++}
++
++void WriteBatch::DeleteRange(ColumnFamilyHandle* family, const Slice& begin,
++                             const Slice& end) {
++  const uint32_t cf = FamilyId(family);
++  if (cf == 0) return DeleteRange(begin, end);
++  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
++  rep_.push_back(static_cast<char>(kCFTypeRangeDeletion));
++  PutVarint32(&rep_, cf);
++  PutLengthPrefixedSlice(&rep_, begin);
++  PutLengthPrefixedSlice(&rep_, end);
++}
++
  void WriteBatch::Append(const WriteBatch& source) {
    WriteBatchInternal::Append(this, &source);
  }
-@@ -126,6 +162,23 @@ class MemTableInserter : public WriteBatch::Handler {
-     mem_->Add(sequence_, kTypeDeletion, key, Slice());
+ 
+ namespace {
++// Routes each record to the memtable of its column family.  A family the
++// map does not name (dropped, or already flushed past this log during
++// recovery) is skipped, but still consumes its sequence number.
+ class MemTableInserter : public WriteBatch::Handler {
+  public:
+   SequenceNumber sequence_;
+-  MemTable* mem_;
++  const std::map<uint32_t, MemTable*>* mems_;
+ 
+-  void Put(const Slice& key, const Slice& value) override {
+-    mem_->Add(sequence_, kTypeValue, key, value);
+-    sequence_++;
++  MemTable* Find(uint32_t cf) const {
++    auto it = mems_->find(cf);
++    return it == mems_->end() ? nullptr : it->second;
+   }
+-  void Delete(const Slice& key) override {
+-    mem_->Add(sequence_, kTypeDeletion, key, Slice());
++  void Add(uint32_t cf, ValueType type, const Slice& key, const Slice& value) {
++    MemTable* mem = Find(cf);
++    if (mem != nullptr) mem->Add(sequence_, type, key, value);
      sequence_++;
    }
++  void Put(const Slice& key, const Slice& value) override {
++    Add(0, kTypeValue, key, value);
++  }
++  void Delete(const Slice& key) override { Add(0, kTypeDeletion, key, Slice()); }
 +  void DeleteRange(const Slice& begin, const Slice& end) override {
-+    mem_->Add(sequence_, kTypeRangeDeletion, begin, end);
-+    sequence_++;
++    Add(0, kTypeRangeDeletion, begin, end);
 +  }
 +  void Merge(const Slice& key, const Slice& value) override {
-+    mem_->Add(sequence_, kTypeMerge, key, value);
-+    sequence_++;
++    Add(0, kTypeMerge, key, value);
++  }
++  void PutCF(uint32_t cf, const Slice& key, const Slice& value) override {
++    Add(cf, kTypeValue, key, value);
++  }
++  void DeleteCF(uint32_t cf, const Slice& key) override {
++    Add(cf, kTypeDeletion, key, Slice());
++  }
++  void DeleteRangeCF(uint32_t cf, const Slice& begin, const Slice& end) override {
++    Add(cf, kTypeRangeDeletion, begin, end);
++  }
++  void MergeCF(uint32_t cf, const Slice& key, const Slice& value) override {
++    Add(cf, kTypeMerge, key, value);
 +  }
 +};
 +
-+// Does the batch hold any merge operand?
-+class MergeFinder : public WriteBatch::Handler {
++// Which families does the batch touch, and does any of them get an operand?
++class BatchScanner : public WriteBatch::Handler {
 + public:
-+  bool found = false;
-+  void Put(const Slice& key, const Slice& value) override {}
-+  void Delete(const Slice& key) override {}
-+  void Merge(const Slice& key, const Slice& value) override { found = true; }
++  std::set<uint32_t> families;
++  std::set<uint32_t> merges;
++  void Put(const Slice& key, const Slice& value) override { families.insert(0); }
++  void Delete(const Slice& key) override { families.insert(0); }
++  void Merge(const Slice& key, const Slice& value) override {
++    families.insert(0);
++    merges.insert(0);
++  }
++  void DeleteRange(const Slice& b, const Slice& e) override { families.insert(0); }
++  void PutCF(uint32_t cf, const Slice& k, const Slice& v) override { families.insert(cf); }
++  void DeleteCF(uint32_t cf, const Slice& k) override { families.insert(cf); }
++  void MergeCF(uint32_t cf, const Slice& k, const Slice& v) override {
++    families.insert(cf);
++    merges.insert(cf);
++  }
++  void DeleteRangeCF(uint32_t cf, const Slice& b, const Slice& e) override {
++    families.insert(cf);
++  }
  };
  }  // namespace
  
-@@ -136,6 +189,12 @@ Status WriteBatchInternal::InsertInto(const WriteBatch* b, MemTable* memtable) {
+-Status WriteBatchInternal::InsertInto(const WriteBatch* b, MemTable* memtable) {
++Status WriteBatchInternal::InsertInto(const WriteBatch* b,
++                                      const std::map<uint32_t, MemTable*>& mems) {
+   MemTableInserter inserter;
+   inserter.sequence_ = WriteBatchInternal::Sequence(b);
+-  inserter.mem_ = memtable;
++  inserter.mems_ = &mems;
    return b->Iterate(&inserter);
  }
  
-+bool WriteBatchInternal::HasMerge(const WriteBatch* b) {
-+  MergeFinder finder;
-+  b->Iterate(&finder);
-+  return finder.found;
++Status WriteBatchInternal::InsertInto(const WriteBatch* b, MemTable* memtable) {
++  std::map<uint32_t, MemTable*> mems{{0, memtable}};
++  return InsertInto(b, mems);
++}
++
++void WriteBatchInternal::Scan(const WriteBatch* b, std::set<uint32_t>* families,
++                              std::set<uint32_t>* merges) {
++  BatchScanner scanner;
++  b->Iterate(&scanner);
++  if (families != nullptr) *families = std::move(scanner.families);
++  if (merges != nullptr) *merges = std::move(scanner.merges);
 +}
 +
  void WriteBatchInternal::SetContents(WriteBatch* b, const Slice& contents) {
    assert(contents.size() >= kHeader);
    b->rep_.assign(contents.data(), contents.size());
 diff --git a/db/write_batch_internal.h b/db/write_batch_internal.h
-index fce86e3..3495d0b 100644
+index fce86e3..c6fbfae 100644
 --- a/db/write_batch_internal.h
 +++ b/db/write_batch_internal.h
-@@ -38,6 +38,9 @@ class WriteBatchInternal {
+@@ -5,6 +5,9 @@
+ #ifndef STORAGE_LEVELDB_DB_WRITE_BATCH_INTERNAL_H_
+ #define STORAGE_LEVELDB_DB_WRITE_BATCH_INTERNAL_H_
+ 
++#include <map>
++#include <set>
++
+ #include "db/dbformat.h"
+ #include "leveldb/write_batch.h"
+ 
+@@ -36,8 +39,17 @@ class WriteBatchInternal {
+   static void SetContents(WriteBatch* batch, const Slice& contents);
+ 
    static Status InsertInto(const WriteBatch* batch, MemTable* memtable);
++  // Inserts each record into the memtable of its family; records of a family
++  // absent from the map are skipped (but consume their sequence number).
++  static Status InsertInto(const WriteBatch* batch,
++                           const std::map<uint32_t, MemTable*>& mems);
  
    static void Append(WriteBatch* dst, const WriteBatch* src);
 +
-+  // Does the batch contain a merge operand?
-+  static bool HasMerge(const WriteBatch* batch);
++  // The ids of the column families the batch touches, and of those that get
++  // a merge operand.  Either output may be null.
++  static void Scan(const WriteBatch* batch, std::set<uint32_t>* families,
++                   std::set<uint32_t>* merges);
  };
  
  }  // namespace leveldb
 diff --git a/include/leveldb/db.h b/include/leveldb/db.h
-index a13d147..09adc81 100644
+index a13d147..2aedf50 100644
 --- a/include/leveldb/db.h
 +++ b/include/leveldb/db.h
-@@ -72,6 +72,16 @@ class LEVELDB_EXPORT DB {
+@@ -7,6 +7,8 @@
+ 
+ #include <cstdint>
+ #include <cstdio>
++#include <string>
++#include <vector>
+ 
+ #include "leveldb/export.h"
+ #include "leveldb/iterator.h"
+@@ -26,6 +28,28 @@ class WriteBatch;
+ // Abstract handle to particular state of a DB.
+ // A Snapshot is an immutable object and can therefore be safely
+ // accessed from multiple threads without any external synchronization.
++// A handle on one column family: an independent key space inside the
++// database, with its own options, memtable and levels.
++class LEVELDB_EXPORT ColumnFamilyHandle {
++ public:
++  virtual ~ColumnFamilyHandle();
++  virtual const std::string& GetName() const = 0;
++  virtual uint32_t GetID() const = 0;
++};
++
++// A column family to open, and the options it is opened with.
++struct LEVELDB_EXPORT ColumnFamilyDescriptor {
++  std::string name;
++  Options options;
++
++  ColumnFamilyDescriptor();
++  ColumnFamilyDescriptor(std::string n, const Options& o)
++      : name(std::move(n)), options(o) {}
++};
++
++// The name of the family every call without a family uses.
++LEVELDB_EXPORT extern const char* kDefaultColumnFamilyName;
++
+ class LEVELDB_EXPORT Snapshot {
+  protected:
+   virtual ~Snapshot();
+@@ -53,6 +77,20 @@ class LEVELDB_EXPORT DB {
+   static Status Open(const Options& options, const std::string& name,
+                      DB** dbptr);
+ 
++  // Opens a database with several column families.  `families` must name
++  // every family the database has (in any order); *handles receives one
++  // handle per descriptor, in the same order.  The caller releases them with
++  // DestroyColumnFamilyHandle before deleting the database.
++  static Status Open(const Options& db_options, const std::string& name,
++                     const std::vector<ColumnFamilyDescriptor>& families,
++                     std::vector<ColumnFamilyHandle*>* handles, DB** dbptr);
++
++  // The names of the column families of the database at `name`, which must
++  // not be open.
++  static Status ListColumnFamilies(const Options& options,
++                                   const std::string& name,
++                                   std::vector<std::string>* names);
++
+   DB() = default;
+ 
+   DB(const DB&) = delete;
+@@ -60,17 +98,46 @@ class LEVELDB_EXPORT DB {
+ 
+   virtual ~DB();
+ 
++  // Column families.  The default family always exists; dropping it is an
++  // error.  A dropped family's handle stops serving reads and writes, but
++  // must still be destroyed.
++  virtual Status CreateColumnFamily(const Options& options,
++                                    const std::string& name,
++                                    ColumnFamilyHandle** handle);
++  virtual Status DropColumnFamily(ColumnFamilyHandle* handle);
++  virtual Status DestroyColumnFamilyHandle(ColumnFamilyHandle* handle);
++  virtual ColumnFamilyHandle* DefaultColumnFamily() const;
++
+   // Set the database entry for "key" to "value".  Returns OK on success,
+   // and a non-OK status on error.
+   // Note: consider setting options.sync = true.
+   virtual Status Put(const WriteOptions& options, const Slice& key,
+                      const Slice& value) = 0;
++  virtual Status Put(const WriteOptions& options, ColumnFamilyHandle* family,
++                     const Slice& key, const Slice& value);
+ 
+   // Remove the database entry (if any) for "key".  Returns OK on
+   // success, and a non-OK status on error.  It is not an error if "key"
+   // did not exist in the database.
    // Note: consider setting options.sync = true.
    virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
- 
++  virtual Status Delete(const WriteOptions& options, ColumnFamilyHandle* family,
++                        const Slice& key);
++
 +  // Remove every entry whose key is in [begin, end).  Nothing happens when
 +  // begin >= end.
 +  virtual Status DeleteRange(const WriteOptions& options, const Slice& begin,
++                             const Slice& end);
++  virtual Status DeleteRange(const WriteOptions& options,
++                             ColumnFamilyHandle* family, const Slice& begin,
 +                             const Slice& end);
 +
 +  // Record a merge operand for "key"; reads fold it into the key's value
 +  // with options.merge_operator.  InvalidArgument if there is none.
 +  virtual Status Merge(const WriteOptions& options, const Slice& key,
 +                       const Slice& value);
-+
++  virtual Status Merge(const WriteOptions& options, ColumnFamilyHandle* family,
++                       const Slice& key, const Slice& value);
+ 
    // Apply the specified updates to the database.
    // Returns OK on success, non-OK on failure.
-   // Note: consider setting options.sync = true.
+@@ -86,6 +153,8 @@ class LEVELDB_EXPORT DB {
+   // May return some other Status on an error.
+   virtual Status Get(const ReadOptions& options, const Slice& key,
+                      std::string* value) = 0;
++  virtual Status Get(const ReadOptions& options, ColumnFamilyHandle* family,
++                     const Slice& key, std::string* value);
+ 
+   // Return a heap-allocated iterator over the contents of the database.
+   // The result of NewIterator() is initially invalid (caller must
+@@ -94,6 +163,8 @@ class LEVELDB_EXPORT DB {
+   // Caller should delete the iterator when it is no longer needed.
+   // The returned iterator should be deleted before this db is deleted.
+   virtual Iterator* NewIterator(const ReadOptions& options) = 0;
++  virtual Iterator* NewIterator(const ReadOptions& options,
++                                ColumnFamilyHandle* family);
+ 
+   // Return a handle to the current DB state.  Iterators created with
+   // this handle will all observe a stable snapshot of the current DB
+@@ -122,6 +193,8 @@ class LEVELDB_EXPORT DB {
+   //  "leveldb.approximate-memory-usage" - returns the approximate number of
+   //     bytes of memory in use by the DB.
+   virtual bool GetProperty(const Slice& property, std::string* value) = 0;
++  virtual bool GetProperty(ColumnFamilyHandle* family, const Slice& property,
++                           std::string* value);
+ 
+   // For each i in [0,n-1], store in "sizes[i]", the approximate
+   // file system space used by keys in "[range[i].start .. range[i].limit)".
+@@ -145,6 +218,8 @@ class LEVELDB_EXPORT DB {
+   // Therefore the following call will compact the entire database:
+   //    db->CompactRange(nullptr, nullptr);
+   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
++  virtual void CompactRange(ColumnFamilyHandle* family, const Slice* begin,
++                            const Slice* end);
+ };
+ 
+ // Destroy the contents of the specified database.
 diff --git a/include/leveldb/merge_operator.h b/include/leveldb/merge_operator.h
 new file mode 100644
 index 0000000..32bb17d
@@ -2986,7 +5555,7 @@ index 0000000..32bb17d
 +
 +#endif  // STORAGE_LEVELDB_INCLUDE_MERGE_OPERATOR_H_
 diff --git a/include/leveldb/options.h b/include/leveldb/options.h
-index 0f285bc..2b3cf4d 100644
+index 0f285bc..ea555e3 100644
 --- a/include/leveldb/options.h
 +++ b/include/leveldb/options.h
 @@ -16,6 +16,7 @@ class Comparator;
@@ -2997,13 +5566,17 @@ index 0f285bc..2b3cf4d 100644
  class Snapshot;
  
  // DB contents are stored in a set of blocks, each of which holds a
-@@ -140,6 +141,9 @@ struct LEVELDB_EXPORT Options {
+@@ -140,6 +141,13 @@ struct LEVELDB_EXPORT Options {
    // Many applications will benefit from passing the result of
    // NewBloomFilterPolicy() here.
    const FilterPolicy* filter_policy = nullptr;
 +
 +  // If non-null, the operator that DB::Merge operands are folded with.
 +  const MergeOperator* merge_operator = nullptr;
++
++  // Open(..., families, ...) creates the named families that do not exist
++  // yet instead of failing.
++  bool create_missing_column_families = false;
  };
  
  // Options that control read operations
@@ -3053,20 +5626,45 @@ index 85710c3..f62ba35 100644
    Status status() const;
  
 diff --git a/include/leveldb/write_batch.h b/include/leveldb/write_batch.h
-index 94d4115..08ca941 100644
+index 94d4115..13a2023 100644
 --- a/include/leveldb/write_batch.h
 +++ b/include/leveldb/write_batch.h
-@@ -37,6 +37,9 @@ class LEVELDB_EXPORT WriteBatch {
+@@ -21,6 +21,7 @@
+ #ifndef STORAGE_LEVELDB_INCLUDE_WRITE_BATCH_H_
+ #define STORAGE_LEVELDB_INCLUDE_WRITE_BATCH_H_
+ 
++#include <cstdint>
+ #include <string>
+ 
+ #include "leveldb/export.h"
+@@ -28,6 +29,7 @@
+ 
+ namespace leveldb {
+ 
++class ColumnFamilyHandle;
+ class Slice;
+ 
+ class LEVELDB_EXPORT WriteBatch {
+@@ -37,6 +39,18 @@ class LEVELDB_EXPORT WriteBatch {
      virtual ~Handler();
      virtual void Put(const Slice& key, const Slice& value) = 0;
      virtual void Delete(const Slice& key) = 0;
 +    // The default implementations ignore the record.
 +    virtual void DeleteRange(const Slice& begin, const Slice& end);
 +    virtual void Merge(const Slice& key, const Slice& value);
++    // Records of a column family.  The defaults call the methods above for
++    // the default family (id 0) and ignore records of any other family.
++    virtual void PutCF(uint32_t column_family, const Slice& key,
++                       const Slice& value);
++    virtual void DeleteCF(uint32_t column_family, const Slice& key);
++    virtual void MergeCF(uint32_t column_family, const Slice& key,
++                         const Slice& value);
++    virtual void DeleteRangeCF(uint32_t column_family, const Slice& begin,
++                               const Slice& end);
    };
  
    WriteBatch();
-@@ -53,6 +56,12 @@ class LEVELDB_EXPORT WriteBatch {
+@@ -53,6 +67,19 @@ class LEVELDB_EXPORT WriteBatch {
    // If the database contains a mapping for "key", erase it.  Else do nothing.
    void Delete(const Slice& key);
  
@@ -3075,6 +5673,13 @@ index 94d4115..08ca941 100644
 +
 +  // Record a merge operand for "key".
 +  void Merge(const Slice& key, const Slice& value);
++
++  // The same, in one column family.
++  void Put(ColumnFamilyHandle* family, const Slice& key, const Slice& value);
++  void Delete(ColumnFamilyHandle* family, const Slice& key);
++  void DeleteRange(ColumnFamilyHandle* family, const Slice& begin,
++                   const Slice& end);
++  void Merge(ColumnFamilyHandle* family, const Slice& key, const Slice& value);
 +
    // Clear all updates buffered in this batch.
    void Clear();

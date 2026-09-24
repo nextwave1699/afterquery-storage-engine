@@ -134,8 +134,22 @@ class AffineOperator : public leveldb::MergeOperator {
 
 // ---- scenarios --------------------------------------------------------------
 
-// What the database should hold: key id -> value.
+// What one column family should hold: key id -> value.
 using ConfModel = std::map<uint64_t, std::string>;
+
+// The scenario's families: index 0 is the default one, 1..kMaxFamilies-1 are
+// named cf1, cf2, ... and come and go during the scenario.
+const uint32_t kMaxFamilies = 4;
+
+inline std::string ConfFamilyName(uint32_t family) {
+  return family == 0 ? "default" : "cf" + std::to_string(family);
+}
+
+// The model of every family, plus which of them exist.
+struct ConfModels {
+  ConfModel m[kMaxFamilies];
+  bool live[kMaxFamilies] = {true, false, false, false};
+};
 
 enum ConfWriteKind { kWPut, kWDelete, kWMerge, kWDeleteRange };
 
@@ -144,6 +158,7 @@ struct ConfWrite {
   uint64_t id;          // kWDeleteRange: begin
   uint64_t end;         // kWDeleteRange: end (exclusive; may be <= begin)
   std::string value;    // kWPut: value, kWMerge: operand
+  uint32_t family = 0;  // one batch may touch several families
 };
 
 enum ConfOpKind {
@@ -155,6 +170,8 @@ enum ConfOpKind {
   kOpSnapCheck,  // read through snapshot `id`, then release it
   kOpReopen,     // close and open the database
   kOpCompact,    // CompactRange over [id, id + count), or everything if count == 0
+  kOpCreate,     // create family `family` (counts as a write: it is durable)
+  kOpDrop,       // drop family `family` (the same)
 };
 
 struct ConfOp {
@@ -163,6 +180,7 @@ struct ConfOp {
   bool single = false;  // kOpWrite: use Put/Delete/Merge/DeleteRange rather than Write
   uint64_t id = 0;
   uint64_t count = 0;
+  uint32_t family = 0;  // which family the read, compaction or DDL is on
 };
 
 // Engine options a scenario runs with; derived from the seed so a crashed
@@ -175,6 +193,9 @@ struct ConfShape {
   uint32_t write_buffer;
   uint32_t max_file;
   uint32_t block_size;
+  // Per-family write buffers, so the families flush at different times and
+  // one family's flush has to leave the others alone.
+  uint32_t family_write_buffer[kMaxFamilies];
 };
 
 class ScenarioGen {
@@ -184,14 +205,16 @@ class ScenarioGen {
   uint64_t keys() const { return shape_.keys; }
   const ConfShape& shape() const { return shape_; }
 
-  // The next operation, given the model as it stands (range clears delete
-  // whatever the model says is live).  False when the scenario is over.
-  bool Next(const ConfModel& model, ConfOp* op);
+  // The next operation, given the models as they stand (range clears delete
+  // whatever a model says is live).  False when the scenario is over.
+  bool Next(const ConfModels& models, ConfOp* op);
 
-  static void Apply(const ConfOp& op, ConfModel* model);
+  static void Apply(const ConfOp& op, ConfModels* models);
 
  private:
   void RandomWrite(ConfWrite* w, uint64_t id, bool allow_merge);
+
+  uint32_t PickFamily(const ConfModels& models);
 
   ConfRng rng_;
   ConfShape shape_;
@@ -200,12 +223,15 @@ class ScenarioGen {
   uint64_t done_ = 0;
   uint64_t version_ = 1;
   int snaps_open_ = 0;
+  bool live_[kMaxFamilies] = {true, false, false, false};
 };
 
 ConfShape ShapeFor(uint64_t seed);
 
-// The model after the first `writes` write operations of a scenario.
-ConfModel ModelAfterWrites(uint64_t seed, uint64_t ops, bool ext, uint64_t writes, bool* past_end);
+// The models after the first `writes` write operations of a scenario
+// (creating and dropping a family counts as one: both are durable).
+ConfModels ModelsAfterWrites(uint64_t seed, uint64_t ops, bool ext, uint64_t writes,
+                             bool* past_end);
 
 void DestroyScenarioDir(const std::string& dir);
 

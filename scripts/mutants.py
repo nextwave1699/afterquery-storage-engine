@@ -44,4 +44,31 @@ M = {
     'rdmap-split-drops-seqs': ('db/range_del.cc',
         '      Frag right = it->second;\n      it->second.end = stop;',
         '      Frag right;\n      right.end = it->second.end;\n      it->second.end = stop;'),
+    'cf-log-never-trimmed': ('db/db_impl.cc',
+        """    const uint64_t oldest = OldestLiveLog();
+    if (logfile_number_ > oldest + kMaxLiveLogs) {""",
+        """    const uint64_t oldest = OldestLiveLog();
+    if (false) {"""),
+    'cf-flush-claims-current-log': ('db/db_impl.cc',
+        """    edit.SetLogNumber(cf->mem_log_number);""",
+        """    edit.SetLogNumber(logfile_number_);"""),
+    'cf-drop-not-durable': ('db/db_impl.cc',
+        """  s = WriteFamilies(env_, dbname_, on_disk, next_family_id_);
+  if (!s.ok()) return s;
+
+  // Its files are nobody's now.""",
+        """  // (the drop is not recorded)
+
+  // Its files are nobody's now."""),
+    'cf-recovery-applies-per-flush': ('db/db_impl.cc',
+        """        status = WriteLevel0Table(cf, it->second, &recovery_edits_[cf->id],
+                                  nullptr);""",
+        """        status = WriteLevel0Table(cf, it->second, &recovery_edits_[cf->id],
+                                  nullptr);
+        if (status.ok()) {
+          VersionEdit e = recovery_edits_[cf->id];
+          e.SetLogNumber(log_number + 1);
+          status = cf->versions->LogAndApply(&e, &mutex_);
+          recovery_edits_.erase(cf->id);
+        }"""),
 }

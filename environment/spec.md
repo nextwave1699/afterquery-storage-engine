@@ -98,7 +98,106 @@ The harness's operator is not commutative (`x -> a*x + b` modulo a prime),
 and `PartialMerge` always succeeds for it.  Operands applied out of order,
 twice, or not at all give a different value.
 
-## 4. Efficiency
+## 4. Column families
+
+A column family is an independent key space inside one database, with its own
+options, its own memtable and its own levels, sharing the database's write-ahead
+log, sequence numbers and snapshots.
+
+    // include/leveldb/db.h
+    class LEVELDB_EXPORT ColumnFamilyHandle {
+     public:
+      virtual ~ColumnFamilyHandle();
+      virtual const std::string& GetName() const = 0;
+      virtual uint32_t GetID() const = 0;
+    };
+
+    struct LEVELDB_EXPORT ColumnFamilyDescriptor {
+      std::string name;
+      Options options;
+    };
+
+    // in class DB
+    static Status Open(const Options& db_options, const std::string& name,
+                       const std::vector<ColumnFamilyDescriptor>& families,
+                       std::vector<ColumnFamilyHandle*>* handles, DB** dbptr);
+    static Status ListColumnFamilies(const Options& options,
+                                     const std::string& name,
+                                     std::vector<std::string>* names);
+    virtual Status CreateColumnFamily(const Options& options,
+                                      const std::string& name,
+                                      ColumnFamilyHandle** handle);
+    virtual Status DropColumnFamily(ColumnFamilyHandle* handle);
+    virtual Status DestroyColumnFamilyHandle(ColumnFamilyHandle* handle);
+    virtual ColumnFamilyHandle* DefaultColumnFamily() const;
+
+    // every read and write takes a family (the existing ones use the default)
+    virtual Status Put(const WriteOptions&, ColumnFamilyHandle*,
+                       const Slice& key, const Slice& value);
+    virtual Status Delete(const WriteOptions&, ColumnFamilyHandle*, const Slice& key);
+    virtual Status Merge(const WriteOptions&, ColumnFamilyHandle*,
+                         const Slice& key, const Slice& value);
+    virtual Status DeleteRange(const WriteOptions&, ColumnFamilyHandle*,
+                               const Slice& begin, const Slice& end);
+    virtual Status Get(const ReadOptions&, ColumnFamilyHandle*,
+                       const Slice& key, std::string* value);
+    virtual Iterator* NewIterator(const ReadOptions&, ColumnFamilyHandle*);
+    virtual void CompactRange(ColumnFamilyHandle*, const Slice* begin,
+                              const Slice* end);
+    virtual bool GetProperty(ColumnFamilyHandle*, const Slice& property,
+                             std::string* value);
+
+    // include/leveldb/write_batch.h, in WriteBatch
+    void Put(ColumnFamilyHandle*, const Slice& key, const Slice& value);
+    void Delete(ColumnFamilyHandle*, const Slice& key);
+    void Merge(ColumnFamilyHandle*, const Slice& key, const Slice& value);
+    void DeleteRange(ColumnFamilyHandle*, const Slice& begin, const Slice& end);
+    // in WriteBatch::Handler; the defaults call the existing methods when the
+    // family is the default one (id 0) and ignore the record otherwise, so
+    // handlers written against the old interface still compile and still work
+    virtual void PutCF(uint32_t cf, const Slice& key, const Slice& value);
+    virtual void DeleteCF(uint32_t cf, const Slice& key);
+    virtual void MergeCF(uint32_t cf, const Slice& key, const Slice& value);
+    virtual void DeleteRangeCF(uint32_t cf, const Slice& begin, const Slice& end);
+
+    // include/leveldb/options.h, in struct Options
+    bool create_missing_column_families = false;
+
+Rules:
+
+* The family named `default` always exists, has id 0, and is what every call
+  without a family uses.  `DB::Open` without descriptors opens it alone, and
+  fails with `InvalidArgument` if the database has other families.
+* `Open` with descriptors must name every family in the database, in any
+  order, and fills `*handles` in the order given.  A named family that does
+  not exist is `InvalidArgument` unless `create_missing_column_families` is
+  set, in which case it is created.  Each descriptor's `Options` apply to
+  that family: `write_buffer_size`, `max_file_size`, `block_size`,
+  `filter_policy`, `merge_operator`, `compression`.  The database-wide
+  options come from the `Options` passed to `Open`.
+* Ids are assigned when a family is created and are never reused, not even
+  after a drop and a re-create of the same name.  `ListColumnFamilies` reads
+  the names from a closed database.
+* A family is a separate key space: the same key in two families is two
+  entries with two values, and an iterator over one never returns another's.
+  Range deletes, merge operands and snapshots all apply per family.
+* One `WriteBatch` may touch several families and applies atomically to all
+  of them; records take sequence numbers in batch order, from the one
+  sequence space the database has.  A snapshot is a point in that space and
+  reads consistently from every family.
+* After `DropColumnFamily`, reads and writes through that handle return
+  `InvalidArgument`, the name may be created again as a new family, and the
+  dropped family's tables are deleted from disk.  The handle must still be
+  released with `DestroyColumnFamilyHandle`.  Dropping the default family is
+  `InvalidArgument`.
+* Crash safety covers all of it: acknowledged writes to every family survive,
+  as do creations and drops, and a crash never resurrects a dropped family
+  or loses another family's data.
+* A database whose only family is `default` stays byte-compatible with the
+  untouched engine, in both directions, exactly as in section 5.  Once
+  another family exists, only your engine has to read the database.
+
+## 5. Efficiency
 
 A range delete must cost about the same whatever it covers; reads must not
 wade through what a range delete hides once a newer layer's tombstone
@@ -137,6 +236,18 @@ not exist), a `Put` after every fourth, two point reads after each, and a
 | CPU time of that loop, all threads (`M_CPU_MS`) | <= 15,000 ms |
 | peak RSS (`VMHWM_KB`) | <= 1 GiB |
 
+`cfwal`: open four families (`default`, `a`, `b`, `c`, 1 MB write buffers),
+write 2 MB into each of `b` and `c` and then nothing more, then 60 MB into
+`a` in small batches, then read everything back.  One family's writes must
+not pin the shared log forever: the engine has to flush the families that
+lag behind so old log files can go.
+
+| limit | value |
+|---|---|
+| bytes of live `.log` files at the end (`W_LOG_BYTES`) | <= 12 MiB |
+| bytes written during the phase (`W_WCHAR`) | <= 400 MiB |
+| peak RSS (`VMHWM_KB`) | <= 1 GiB |
+
 `merge`: load 20,000 keys with 400-byte values and compact everything.
 **A**: 400,000 `Merge` calls on random keys; then reads.
 **B**: `CompactRange(nullptr, nullptr)`, reopen, reads.
@@ -151,7 +262,7 @@ not exist), a `Put` after every fourth, two point reads after each, and a
 Every read in these cases is checked against the model, like everywhere
 else.  The exact code is `RunPerfCase` in `/app/bench/conf_model.cc`.
 
-## 5. What stays the same
+## 6. What stays the same
 
 * Every existing behaviour of the public API and every public header stays
   source-compatible.
